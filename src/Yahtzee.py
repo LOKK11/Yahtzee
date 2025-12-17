@@ -1,30 +1,139 @@
 import random
+import torch
+import numpy as np
+from YahtzeeAI import YahtzeeNet
+
+MODEL = "models/avg200.pth"
 
 
 class Yahtzee:
     def __init__(self):
-        self.dice = []
+        self.dice = [0] * 5
         self.locked = []
-        self.locks_used = 0
         self.rolls_left = 3
-        self.categories = {
-            "ones": None,
-            "twos": None,
-            "threes": None,
-            "fours": None,
-            "fives": None,
-            "sixes": None,
-            "two_of_a_kind": None,
-            "two_pairs": None,
-            "three_of_a_kind": None,
-            "four_of_a_kind": None,
-            "full_house": None,
-            "small_straight": None,
-            "large_straight": None,
-            "yahtzee": None,
-            "chance": None,
-            "bonus": None,
-        }
+        # Use a list for categories to maintain index order 0-15 matching the AI
+        self.category_names = [
+            "ones",
+            "twos",
+            "threes",
+            "fours",
+            "fives",
+            "sixes",
+            "two_of_a_kind",
+            "two_pairs",
+            "three_of_a_kind",
+            "four_of_a_kind",
+            "full_house",
+            "small_straight",
+            "large_straight",
+            "yahtzee",
+            "chance",
+            "bonus",
+        ]
+        self.categories = {name: None for name in self.category_names}
+        self.categories_played = 0
+        self.neural_network = False
+        self.model = None
+        self.device = torch.device("cpu")
+
+        # Roll Action Masks (copied from YahtzeeFast for decoding AI moves)
+        self.roll_action_masks = np.zeros((32, 5), dtype=bool)
+        for i in range(32):
+            for bit in range(5):
+                if (i >> bit) & 1:
+                    self.roll_action_masks[i, bit] = True
+
+    def load_model(self):
+        """Loads the latest model from the models directory."""
+        try:
+            input_dim = (
+                62  # 30 (dice) + 16 (categories) + 13 (upper score) + 3 (rolls left)
+            )
+            output_dim = 47  # 15 categories + 32 roll combinations
+
+            self.model = YahtzeeNet(input_dim, output_dim)
+            self.model.load_state_dict(torch.load(MODEL, map_location=self.device))
+            self.model.eval()
+            self.neural_network = True
+            print(f"Loaded model: {MODEL}")
+            return True
+        except Exception as e:
+            print(f"Failed to load model: {e}")
+            return False
+
+    def get_encoded_state(self):
+        """Encodes the current state into a tensor (1, 62) for the AI."""
+        encoded = np.zeros((1, 62), dtype=np.float32)
+
+        current_dice = np.array(self.dice)
+        if np.sum(current_dice) > 0:
+            val_offsets = (current_dice - 1) * 5
+            pos_indices = np.arange(5)
+            flat_indices = val_offsets + pos_indices
+            encoded[0, flat_indices] = 1.0
+
+        for i, name in enumerate(self.category_names):
+            if self.categories[name] is not None:
+                encoded[0, 30 + i] = 1.0
+
+        # 3. Upper Section Score (13 inputs)
+        # Calculate upper score
+        upper_score = 0
+        for name in self.category_names[:6]:
+            val = self.categories[name]
+            if val is not None:
+                upper_score += val
+
+        upper_score = min(upper_score, 63)
+        upper_bucket = int(upper_score // (63 / 12))
+        encoded[0, 46 + upper_bucket] = 1.0
+
+        encoded[0, 59 + self.rolls_left] = 1.0
+
+        return torch.tensor(encoded, dtype=torch.float32).to(self.device)
+
+    def get_action_mask(self):
+        """Returns boolean mask for valid actions."""
+        mask = torch.zeros((1, 47), dtype=torch.bool)
+
+        can_pick_category = self.rolls_left == 0
+
+        if not can_pick_category:
+            mask[0, 15:] = True
+        else:
+            for i in range(15):
+                if self.categories[self.category_names[i]] is None:
+                    mask[0, i] = True
+
+        return mask
+
+    def get_ai_prediction(self):
+        """Returns the best action string description."""
+        if not self.model or not self.neural_network:
+            return ""
+
+        state = self.get_encoded_state()
+        mask = self.get_action_mask()
+
+        with torch.no_grad():
+            q_values = self.model(state)
+            q_values = q_values.masked_fill(~mask, -1e12)
+            action_idx = q_values.argmax().item()
+
+        # Decode Action
+        if action_idx < 15:
+            cat_name = self.category_names[action_idx].replace("_", " ").title()
+            return f"Pick Category: {cat_name}"
+        else:
+            roll_mask_idx = action_idx - 15
+            keep_mask = self.roll_action_masks[roll_mask_idx]
+
+            keep_indices = [i + 1 for i, keep in enumerate(keep_mask) if keep]
+
+            if not keep_indices:
+                return "Roll Again (Keep None)"
+            else:
+                return f"Roll Again (Keep positions: {keep_indices})"
 
     def roll_dice(self):
         if self.rolls_left == 3:
@@ -40,36 +149,19 @@ class Yahtzee:
 
     def reset_dice(self):
         """Resets the dice and rolls left"""
-        self.dice = []
+        self.dice = [0] * 5  # Visual reset
         self.locked = []
         self.rolls_left = 3
-        self.locks_used = 0
 
-    def lock_dice(self, dice_to_lock):
+    def lock_dice(self, dice_idx):
         """Locks the dice that the player wants to keep"""
-        self.locked.append(dice_to_lock)
-        self.locks_used += 1
+        if dice_idx not in self.locked:
+            self.locked.append(dice_idx)
 
-    def lock_dice_with_number(self, number):
-        """Locks one dice with the specified number"""
-        for i in range(5):
-            if self.dice[i] == number and i not in self.locked:
-                self.locked.append(i)
-                self.locks_used += 1
-                break
-
-    def unlock_dice(self, dice_to_unlock):
+    def unlock_dice(self, dice_idx):
         """Unlocks the dice that the player wants to unlock"""
-        self.locked.remove(dice_to_unlock)
-        self.locks_used += 1
-
-    def unlock_dice_with_number(self, number):
-        """Unlocks one dice with the specified number"""
-        for i in range(5):
-            if self.dice[i] == number and i in self.locked:
-                self.locked.remove(i)
-                self.locks_used += 1
-                break
+        if dice_idx in self.locked:
+            self.locked.remove(dice_idx)
 
     def calculate_score(self, category):
         """Place the dices to one of the categories"""
@@ -86,10 +178,13 @@ class Yahtzee:
         if category == "sixes":
             return self.dice.count(6) * 6
         if category == "bonus":
-            if sum(self.dice) >= 63:
-                return 50
-            else:
-                return 0
+            # Recalculate bonus based on actual filled categories
+            score = 0
+            for cat in ["ones", "twos", "threes", "fours", "fives", "sixes"]:
+                val = self.categories.get(cat)
+                if val is not None:
+                    score += val
+            return 50 if score >= 63 else 0
 
         if category == "two_of_a_kind":
             for i in range(6, 0, -1):
@@ -116,64 +211,35 @@ class Yahtzee:
                     return 4 * i
             return 0
         elif category == "full_house":
-            three_of_a_kind = None
-            two_of_a_kind = None
-            for i in range(6, 0, -1):
-                if self.dice.count(i) >= 3:
-                    three_of_a_kind = i
-                    continue
-                if self.dice.count(i) >= 2:
-                    two_of_a_kind = i
-            if three_of_a_kind and two_of_a_kind:
-                return three_of_a_kind * 3 + two_of_a_kind * 2
+            counts = {x: self.dice.count(x) for x in set(self.dice)}
+            is_FH = 3 in counts.values() and 2 in counts.values()
+
+            if is_FH:
+                return sum(self.dice)  # Provided file logic used sum
             else:
                 return 0
+
         elif category == "small_straight":
-            if sorted(self.dice) == [1, 2, 3, 4, 5]:
+            uniq = sorted(list(set(self.dice)))
+            if uniq == [1, 2, 3, 4, 5]:
                 return 15
             else:
                 return 0
         elif category == "large_straight":
-            if sorted(self.dice) == [2, 3, 4, 5, 6]:
+            uniq = sorted(list(set(self.dice)))
+            if uniq == [2, 3, 4, 5, 6]:
                 return 20
             else:
                 return 0
         elif category == "yahtzee":
-            if self.dice.count(self.dice[0]) == 5:
+            if len(set(self.dice)) == 1 and self.dice[0] != 0:
                 return 50
             else:
                 return 0
         elif category == "chance":
             return sum(self.dice)
 
-    def get_normalized_score(self, category):
-        """Returns the normalized score for a category"""
-        max_scores = {
-            "ones": 5,
-            "twos": 10,
-            "threes": 15,
-            "fours": 20,
-            "fives": 25,
-            "sixes": 30,
-            "bonus": 50,
-            "two_of_a_kind": 12,
-            "two_pairs": 22,
-            "three_of_a_kind": 18,
-            "four_of_a_kind": 24,
-            "full_house": 25,
-            "small_straight": 15,
-            "large_straight": 20,
-            "yahtzee": 50,
-            "chance": 30,
-        }
-        score = self.categories.get(category)
-        if score is None:
-            return 0.0
-        max_score = max_scores.get(category)
-        return score / max_score
-
     def get_upper_section_score(self):
-        """Returns the score of the upper section"""
         score = 0
         for category in ["ones", "twos", "threes", "fours", "fives", "sixes"]:
             value = self.categories.get(category)
@@ -181,103 +247,24 @@ class Yahtzee:
                 score += value
         return score
 
-    def get_total_score(self):
+    def get_score(self):
         """Returns the score of the game"""
         score = 0
-        for _, value in self.categories.items():
+        for name, value in self.categories.items():
             if value is not None:
                 score += value
         return score
-
-    def get_normalized_total_score(self):
-        """Returns the normalized total score"""
-        total_score = self.get_total_score()
-        max_total_score = 371  # Maximum possible score in Yahtzee
-        return total_score / max_total_score
 
     def select_category(self, category):
         """Select a category to place the dice in"""
         if self.categories[category] is None:
             self.categories[category] = self.calculate_score(category)
+            self.categories_played += 1
+            # Update bonus immediately
+            self.categories["bonus"] = self.calculate_score("bonus")
         else:
             print("Category already used")
 
-    def get_valid_categories(self):
-        """Returns a list of valid categories"""
-        return [
-            cat
-            for cat, val in self.categories.items()
-            if val is None and cat != "bonus"
-        ]
-
-    def get_valid_actions(self):
-        """Returns a list of valid actions"""
-        CATEGORIES = 15
-        DICE_VALUES = 6
-        actions = []
-        if self.rolls_left < 3:
-            for cat in self.get_valid_categories():
-                actions.append(
-                    list(self.categories.keys()).index(cat)
-                )  # Category action
-        if self.rolls_left > 0:
-            actions.append(CATEGORIES)  # Roll action
-        if self.locks_used < 5:
-            locked_values = [self.dice[i] for i in self.locked]
-            for i in range(1, DICE_VALUES + 1):
-                if i in self.dice and i not in locked_values:
-                    actions.append(CATEGORIES + i)  # Lock action
-                if i in locked_values:
-                    actions.append(CATEGORIES + DICE_VALUES + i)  # Unlock action
-
-        return actions
-
-    def get_action_mask(self):
-        """Returns a boolean mask of valid actions."""
-        mask = [False] * 28  # Initialize all actions as invalid
-        valid_actions = self.get_valid_actions()
-        for action in valid_actions:
-            mask[action] = True
-        return mask
-
     def is_over(self):
         """Checks if the game is over"""
-        return all(
-            value is not None
-            for key, value in self.categories.items()
-            if key != "bonus"
-        )
-
-    def take_action(self, action):
-        """Takes an action in the game"""
-        CATEGORIES = 15
-        DICE_VALUES = 6
-
-        if action < CATEGORIES:
-            category_list = list(self.categories.keys())
-            category = category_list[action]
-            self.select_category(category)
-            self.reset_dice()
-        elif action == CATEGORIES:
-            self.roll_dice()
-        elif CATEGORIES < action <= CATEGORIES + DICE_VALUES:
-            number_to_lock = action - CATEGORIES
-            self.lock_dice_with_number(number_to_lock)
-        else:
-            number_to_unlock = action - CATEGORIES - DICE_VALUES
-            self.unlock_dice_with_number(number_to_unlock)
-
-    def get_normalized_dice_counts(self):
-        """Returns a list with the normalized counts of each dice value"""
-        counts = [0] * 6
-        for die in self.dice:
-            counts[die - 1] += 1 / 5.0  # Normalize counts
-        return counts
-
-    def get_normalized_locked_counts(self):
-        """Returns a list with the normalized counts of locked dice values"""
-        counts = [0] * 6
-        for i in self.locked:
-            die = self.dice[i]
-            counts[die - 1] += 1 / 5.0  # Normalize counts
-        return counts
+        return self.categories_played == 15

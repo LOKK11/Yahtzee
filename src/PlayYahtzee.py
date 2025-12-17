@@ -1,6 +1,12 @@
 import tkinter as tk
 
-from components import category_frame, dice_buttons, roll_button, total_score_label
+from components import (
+    category_frame,
+    dice_buttons,
+    roll_button,
+    total_score_label,
+    enable_neural_network_button,
+)
 from Yahtzee import Yahtzee
 
 
@@ -13,10 +19,11 @@ class YahtzeeApp:
         self.init()
 
     def init(self):
+        enable_neural_network_button(self)
+        total_score_label(self)
         roll_button(self)
         dice_buttons(self)
         category_frame(self)
-        total_score_label(self)
 
 
 if __name__ == "__main__":

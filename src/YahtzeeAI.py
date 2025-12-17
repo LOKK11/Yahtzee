@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+import time
 import os
 import random
 
@@ -5,307 +7,431 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
 
-from Yahtzee import Yahtzee
+from YahtzeeFast import YahtzeeFast
+import argparse
+import matplotlib.pyplot as plt
+
+DICE_VALUES = 30
+CATEGORIES = 16
+UPPER_SECTION_FIELDS = 13
+ROLLS_LEFT = 3
+
+good_scores = [
+    3,  # Ones
+    6,  # Twos
+    9,  # Threes
+    12,  # Fours
+    15,  # Fives
+    18,  # Sixes
+    10,  # Two of a kind
+    18,  # Two pairs
+    15,  # Three of a kind
+    16,  # Four of a kind
+    22,  # Full house
+    15,  # Small straight
+    20,  # Large straight
+    50,  # Yahtzee
+    22,  # Chance
+]
+
+max_scores = [
+    5,  # Ones
+    10,  # Twos
+    15,  # Threes
+    20,  # Fours
+    25,  # Fives
+    30,  # Sixes
+    12,  # Two of a kind
+    22,  # Two pairs
+    18,  # Three of a kind
+    24,  # Four of a kind
+    28,  # Full house
+    15,  # Small straight
+    20,  # Large straight
+    50,  # Yahtzee
+    30,  # Chance
+]
 
 
-# Simple feed-forward network with policy and value heads for Yahtzee decisions.
 class YahtzeeNet(nn.Module):
-    def __init__(self, input_size, hidden_size, action_size):
+    def __init__(self, input_dim, output_dim):
         super().__init__()
-        self.trunk = nn.Sequential(
-            nn.Linear(input_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size),
+
+        self.dice_layer = nn.Sequential(
+            nn.Linear(DICE_VALUES, 512),
             nn.ReLU(),
         )
-        self.policy_head = nn.Linear(hidden_size, action_size)  # logits for actions
-        self.value_head = nn.Linear(hidden_size, 1)  # state value
+
+        self.category_layer = nn.Sequential(
+            nn.Linear(CATEGORIES + UPPER_SECTION_FIELDS + ROLLS_LEFT, 512),
+            nn.ReLU(),
+        )
+
+        self.common_stream = nn.Sequential(
+            nn.Linear(512 + 512, 2048),
+            nn.ReLU(),
+            nn.Linear(2048, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+        )
+
+        self.value_stream = nn.Sequential(
+            nn.Linear(512, 1),
+        )
+
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(512, output_dim),
+        )
 
     def forward(self, x):
-        h = self.trunk(x)
-        logits = self.policy_head(h)
-        value = self.value_head(h).squeeze(-1)
-        return logits, value
+        dice_features = self.dice_layer(x[:, :DICE_VALUES])
+        other_features = self.category_layer(x[:, DICE_VALUES:])
+
+        combined_features = torch.cat((dice_features, other_features), dim=1)
+
+        combined_features = self.common_stream(combined_features)
+
+        values = self.value_stream(combined_features)
+        advantages = self.advantage_stream(combined_features)
+
+        # Q = V + (A - mean(A))
+        q_vals = values + (advantages - advantages.mean(dim=1, keepdim=True))
+
+        return q_vals
 
 
-# Convert a game state into a flat tensor.
-def encode_state(game: Yahtzee) -> torch.Tensor:
-    counts = game.get_normalized_dice_counts()
+def train_model(policy_net, states, actions, targets, optimizer, clip_grad=1.0):
+    policy_net.train()
 
-    locked = game.get_normalized_locked_counts()
+    all_q_values = policy_net(states)
 
-    sc_vec = []
-    for cat in game.categories.keys():
-        sc_vec.append(game.get_normalized_score(cat))
+    q_pred = all_q_values.gather(1, actions)
 
-    # rolls_left scalar
-    rolls_left_norm = [float(game.rolls_left) / 3.0]
+    loss = F.smooth_l1_loss(q_pred, targets)
 
-    # Total score scalar
-    total_score_norm = [game.get_normalized_total_score()]
-    return torch.tensor(
-        counts + locked + sc_vec + rolls_left_norm + total_score_norm,
-        dtype=torch.float32,
-    )
+    optimizer.zero_grad()
+    loss.backward()
 
+    if clip_grad:
+        nn.utils.clip_grad_norm_(policy_net.parameters(), clip_grad)
 
-# Dataset expects tuples of (state_tensor, action_index, return_value, advantage)
-# For supervised / imitation you can set advantage = 1 and return_value = target value
-class YahtzeeDataset(Dataset):
-    def __init__(self, examples):
-        # examples: list of dicts with keys: 'state', 'action', 'value', 'adv'
-        self.examples = examples
+    optimizer.step()
 
-    def __len__(self):
-        return len(self.examples)
-
-    def __getitem__(self, idx):
-        ex = self.examples[idx]
-        return ex["state"], ex["action"], ex["value"], ex.get("adv", 1.0)
+    return loss.item()
 
 
-# Train function using policy gradient style loss + value MSE
-def train_model(
-    model, dataset, epochs=10, batch_size=64, lr=1e-4, clip_grad=1.0, device=None
-):
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    opt = optim.Adam(model.parameters(), lr=lr)
-
-    for epoch in range(epochs):
-        model.train()
-        epoch_policy_loss = 0.0
-        epoch_value_loss = 0.0
-        for states, actions, values, advs in loader:
-            states = states.to(device)
-            actions = actions.to(device)
-            values = values.to(device)
-            advs = advs.to(device)
-
-            logits, preds = model(states)
-            logp = F.softmax(logits, dim=-1)
-            # Gather log-prob of taken actions
-            logp_a = logp.gather(1, actions.unsqueeze(1)).squeeze(1)
-
-            policy_loss = -(logp_a * advs).mean()
-            value_loss = F.mse_loss(preds, values)
-
-            # entropy bonus to encourage exploration
-            probs = F.softmax(logits, dim=-1)
-            entropy = -(probs * logp).sum(dim=-1).mean()
-            loss = policy_loss + value_loss - 0.01 * entropy
-
-            opt.zero_grad()
-            loss.backward()
-            if clip_grad:
-                nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
-            opt.step()
-
-            epoch_policy_loss += policy_loss.item() * states.size(0)
-            epoch_value_loss += value_loss.item() * states.size(0)
-
-        n = len(dataset)
-        # simple progress print; remove or adapt to logging in your app
-        print(
-            f"Epoch {epoch + 1}/{epochs} policy_loss={epoch_policy_loss / n:.4f} value_loss={epoch_value_loss / n:.4f}"
-        )
-
-    return model
-
-
-# Choose action given a raw game state. Returns (action_index, probs_tensor)
-def select_action(
-    model,
-    game,
-    action_mask=None,
-    deterministic=False,
-    device=None,
-):
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    state = encode_state(game).unsqueeze(0).to(device)
-    model.to(device)
-    model.eval()
-    with torch.no_grad():
-        logits, _ = model(state)
-        if action_mask is not None:
-            mask = torch.tensor(action_mask, dtype=torch.bool, device=device)
-            large_neg = -1e9
-            logits = logits.masked_fill(~mask.unsqueeze(0), large_neg)
-        probs = F.softmax(logits, dim=-1).squeeze(0)
-        if deterministic:
-            action = int(probs.argmax().item())
-        else:
-            action = int(torch.multinomial(probs, 1).item())
-    return action, probs
-
-
-# Save / load helpers
-def save_model(model, path):
+def save_model(model: YahtzeeNet, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(model.state_dict(), path)
 
 
-def load_model(path, input_size, hidden_size, action_size, device=None):
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model = YahtzeeNet(input_size, hidden_size, action_size).to(device)
-    model.load_state_dict(torch.load(path, map_location=device))
-    model.eval()
-    return model
+def self_play_fast(
+    policy_net: YahtzeeNet,
+    device,
+    epsilon=0,
+    plot_stats=False,
+    games_to_play=8192,
+):
+    env = YahtzeeFast(games_to_play, device=device)
+    steps_in_game = 3 * 15
 
+    num_random_actions = int(steps_in_game * epsilon)
+    actions = [True] * num_random_actions + [False] * (
+        steps_in_game - num_random_actions
+    )
+    random.shuffle(actions)
 
-def self_play_game(model, epsilon=0.1, device=None):
-    """
-    Play one game using the model (with epsilon-greedy exploration).
-    Returns list of examples with (state, action, reward, advantage).
-    """
-    states = []
-    actions = []
-    rewards = []
-
-    game = Yahtzee()
-
-    while not game.is_over():
-        state = encode_state(game)
-
-        # Epsilon-greedy: random action with probability epsilon
-        if random.random() < epsilon:
-            valid_actions = game.get_valid_actions()
-            action = random.choice(valid_actions)
-        else:
-            action_mask = game.get_action_mask()  # Boolean mask of valid actions
-            action, _ = select_action(
-                model, game, action_mask, deterministic=False, device=device
-            )
-
-        old_score = game.get_normalized_total_score()
-        game.take_action(action)
-        new_score = game.get_normalized_total_score()
-        # print(f"Action taken: {action}, Score: {new_score}")
-
-        reward = new_score - old_score
-
-        states.append(state)
-        actions.append(torch.tensor(action, dtype=torch.long))
-        rewards.append(reward)
-
-    # Calculate returns
-    # returns = calculate_returns(rewards, gamma=0.99)
-
-    # Build examples
     examples = []
-    total_score = game.get_normalized_total_score()
-    for i in range(len(states)):
-        examples.append(
-            {
-                "state": states[i],
-                "action": actions[i],
-                "value": torch.tensor(
-                    (rewards[i] + total_score) / 2, dtype=torch.float32
-                ),
-                "adv": torch.tensor(1.0, dtype=torch.float32),
-            }
+
+    for is_random in actions:
+        state_gpu = env.get_encoded_state()
+        masks_gpu = env.get_action_masks()
+
+        # Select Actions
+        if is_random:
+            noise = torch.rand(size=(games_to_play, masks_gpu.shape[1]), device=device)
+            noise = noise.masked_fill(~masks_gpu, -1e12)
+            actions_gpu = noise.argmax(dim=1)
+        else:
+            policy_net.eval()
+            with torch.no_grad():
+                q_vals = policy_net(state_gpu)
+                probs = F.softmax(q_vals, dim=-1)
+                probs = probs.masked_fill(~masks_gpu, 0.0)
+
+                # if plot_stats:
+                actions_gpu = probs.argmax(dim=1)
+                # else:
+                # actions_gpu = torch.multinomial(probs, 1).squeeze(1)
+
+        # Step Environment
+        rewards, dones, average_score = env.step(actions_gpu)
+
+        next_state_gpu = env.get_encoded_state()
+        next_masks_gpu = env.get_action_masks()
+
+        batch_data = zip(
+            state_gpu, actions_gpu, rewards, next_state_gpu, dones, next_masks_gpu
         )
 
-    return examples, game.get_total_score()
+        examples.extend(batch_data)
+
+    if plot_stats:
+        plot_statistics(examples, average_score, games_to_play)
+
+    return examples, games_to_play, average_score
 
 
-def calculate_returns(rewards, gamma=0.99):
-    """Calculate discounted returns."""
-    returns = []
-    G = 0
-    for r in reversed(rewards):
-        G = r + gamma * G
-        returns.insert(0, G)
-    return returns
+def plot_statistics(examples, total_average_score, games_played):
+    category_rewards = [[0 for _ in range(max_scores[i] + 1)] for i in range(15)]
+    roll_counts = [0] * 32
+    bonus_count = 0
+    yahtzee_count = 0
+    for ex in examples:
+        state, action, reward, next_state, done, next_mask = ex
+        if action < 6 and reward > 50:
+            category_rewards[action][int(reward) - 50] += 1
+            bonus_count += 1
+        elif action == 13 and reward == 50:
+            category_rewards[action][int(reward)] += 1
+            yahtzee_count += 1
+        elif action < 15:
+            category_rewards[action][int(reward)] += 1
+        else:
+            roll_counts[action - 15] += 1
+
+    plt.figure(figsize=(25, 13))
+    plt.suptitle(
+        f"Games played: {games_played}, Average Score: {total_average_score:.2f}, Bonus Count: {bonus_count}",
+        fontsize=16,
+    )
+    for i in range(16):
+        plt.subplot(4, 4, i + 1)
+        if i < 15:
+            plt.bar(
+                range(len(category_rewards[i])),
+                category_rewards[i],
+                color="blue",
+                alpha=0.7,
+            )
+            plt.title(f"Category {i} Rewards")
+            plt.ylabel("Reward")
+        else:
+            plt.bar(range(32), roll_counts, color="green", alpha=0.7)
+            plt.title("Roll Actions Count")
+            plt.ylabel("Count")
+    plt.show()
 
 
 def train_from_scratch(
-    model: YahtzeeNet, num_iterations=1000, games_per_iter=50, device=None
+    policy_net: YahtzeeNet,
+    target_net: YahtzeeNet,
+    device,
+    num_iterations=200,
+    start_iter=0,
 ):
     """
     Train model from scratch using self-play.
     """
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    print(f"Training on device: {device}")
+    policy_net.to(device)
+    target_net.to(device)
+    TRAIN_COUNT = 500
+    BATCH_SIZE = 1024
+    best_avg_score = 0.0
+    avg_score_list = []
+    iteration_list = []
+    epsilon_list = []
 
-    for iteration in range(num_iterations):
+    all_examples = []
+    period_start = time.perf_counter()
+    estimated_time = None
+    total_time_start = datetime.now()
+    ten_last_times = []
+    for iteration in range(start_iter, num_iterations):
         print(f"\n=== Iteration {iteration + 1}/{num_iterations} ===")
+        start_time = datetime.now()
 
-        # Collect games
-        all_examples = []
-        scores = []
-        epsilon = max(
-            0.1, 1.0 - iteration / (num_iterations * 0.5)
-        )  # Decay exploration
+        # epsilon = 0.9 - (iteration % 10 / 10)
+        epsilon = 0.1
 
-        for _ in range(games_per_iter):
-            examples, final_score = self_play_game(
-                model, epsilon=epsilon, device=device
-            )
-            all_examples.extend(examples)
-            scores.append(final_score)
+        examples, games_played, avg_score = self_play_fast(
+            policy_net, device=device, epsilon=epsilon
+        )
+        all_examples.extend(examples)
 
-        avg_score = sum(scores) / len(scores)
+        if avg_score > best_avg_score:
+            best_avg_score = avg_score
+        avg_score_list.append(avg_score)
+        iteration_list.append(iteration + 1)
+        epsilon_list.append(epsilon)
+
+        play_time = datetime.now()
         print(
-            f"Games played: {games_per_iter}, Avg score: {avg_score:.1f}, Epsilon: {epsilon:.3f}"
+            f"Games played: {games_played}, Average score: {avg_score:.2f}, "
+            f"Best score: {best_avg_score:.2f} "
+            f"Epsilon: {epsilon:.3f}, Steps in memory: {len(all_examples)} "
+            f"Play time: {(play_time - start_time).total_seconds():.2f}s"
         )
 
-        # Improve advantages using baseline
-        if iteration > 0:  # After first iteration, use value predictions as baseline
-            dataset_temp = YahtzeeDataset(all_examples)
-            loader = DataLoader(
-                dataset_temp, batch_size=len(all_examples), shuffle=False
-            )
-
-            model.eval()
-            with torch.no_grad():
-                for states, actions, values, _ in loader:
-                    states = states.to(device)
-                    values = values.to(device)
-                    _, baseline_values = model(states)
-                    advantages = values - baseline_values
-
-                    # Update advantages in examples
-                    for i, ex in enumerate(all_examples):
-                        ex["adv"] = advantages[i]
-
         # Train on collected data
-        dataset = YahtzeeDataset(all_examples)
-        train_model(model, dataset, epochs=5, batch_size=64, lr=1e-3, device=device)
+        total_loss = 0.0
+        optimizer = optim.Adam(policy_net.parameters(), lr=1e-4)
+        for _ in range(TRAIN_COUNT):
+            batch = random.sample(all_examples, BATCH_SIZE)
+            states, actions, targets = calculate_targets(
+                policy_net, target_net, batch, device
+            )
+            loss = train_model(policy_net, states, actions, targets, optimizer)
+            total_loss += loss
+        avg_loss = total_loss / TRAIN_COUNT
+        print(
+            f"Training loss: {avg_loss:.4f}, Training time: "
+            f"{(datetime.now() - play_time).total_seconds():.2f}s"
+        )
+        # Remove 25% of old examples to keep memory size manageable
+        if len(all_examples) > 8192 * 15 * 3:
+            remove_count = len(all_examples) // 2
+            all_examples = all_examples[remove_count:]
 
+        current_time = time.perf_counter()
+        if not ten_last_times:
+            ten_last_times = [current_time - period_start] * 10
+        else:
+            ten_last_times[iteration % 10] = current_time - period_start
+        period_start = current_time
+        estimated_seconds = (
+            sum(ten_last_times) / len(ten_last_times) * (num_iterations - iteration - 1)
+        )
+        estimated_time = timedelta(seconds=int(estimated_seconds))
+        print(f"Estimated time remaining: {str(estimated_time).split('.')[0]}")
+
+        # Update Target Network
+        if (iteration + 1) % 2 == 0:
+            target_net.load_state_dict(policy_net.state_dict())
         # Save checkpoint
-        if (iteration + 1) % 100 == 0:
-            save_model(model, f"models/yahtzee_iter_{iteration + 1}.pth")
+        if (iteration + 1) % 20 == 0:
+            save_model(policy_net, f"models/iter{iteration + 1}.pth")
+            print(f"Model checkpoint saved at iteration {iteration + 1}")
 
-    return model
+    total_elapsed = datetime.now() - total_time_start
+    plot_training_progress(
+        iteration_list, avg_score_list, epsilon_list, best_avg_score, total_elapsed
+    )
+    return policy_net
 
 
-# Example minimal usage (replace dataset building with your self-play / recorded games).
-if __name__ == "__main__":
-    DICE_VALUES = 6
-    LOCKED_DICES = 6
-    ROLLS_LEFT = 1
-    CATEGORIES = 16
-    TOTAL_SCORE = 1
-    input_size = DICE_VALUES + LOCKED_DICES + ROLLS_LEFT + CATEGORIES + TOTAL_SCORE
-    # Actions
-    SELECT_CATEGORY = CATEGORIES - 1  # Bonus is not selectable
-    ROLL_DICE = 1
-    LOCK_DICE = 6
-    UNLOCK_DICE = 6
-    action_size = SELECT_CATEGORY + ROLL_DICE + LOCK_DICE + UNLOCK_DICE
-    model = YahtzeeNet(input_size, 128, action_size)
+def plot_training_progress(
+    iterations, avg_scores, epsilons, best_avg_score, total_elapsed
+):
+    plt.figure(figsize=(10, 5))
+    plt.title("Training completed")
+    plt.suptitle(
+        f"Best achieved average score: {best_avg_score:.2f}, Total training time: {str(total_elapsed).split('.')[0]}"
+    )
+    plt.plot(
+        iterations, [avg_score.cpu() for avg_score in avg_scores], label="Average Score"
+    )
+    plt.plot(
+        iterations, [e * 100 for e in epsilons], label="Random action probability (%)"
+    )
+    plt.title("Training Progress: Average Score over Iterations")
+    plt.xlabel("Iteration")
+    plt.ylabel("Average Score / Epsilon (%)")
+    plt.grid(True)
+    plt.legend()
+    plt.show()
 
-    # Train from scratch
-    trained_model = train_from_scratch(
-        model,
-        num_iterations=100,
-        games_per_iter=50,
-        device="cuda" if torch.cuda.is_available() else "cpu",
+
+def calculate_targets(policy_net, target_net, batch, device, gamma=0.99):
+    """
+    Calculates the Bellman Targets using Double DQN logic.
+    """
+
+    states, actions, rewards, next_states, dones, next_masks = zip(*batch)
+    # Stack and move to device
+    states = torch.stack(states)
+    actions = torch.stack(actions).unsqueeze(1)
+    rewards = torch.stack(rewards).unsqueeze(1)
+    next_states = torch.stack(next_states)
+    dones = torch.stack(dones).unsqueeze(1)
+    next_masks = torch.stack(next_masks)
+
+    with torch.no_grad():  # Don't update gradients here
+        next_q_values_raw = policy_net(next_states)
+
+        next_q_values_raw = next_q_values_raw.masked_fill(~next_masks, -1e12)
+
+        next_action_indices = next_q_values_raw.argmax(dim=1, keepdim=True)
+
+        next_q_values = target_net(next_states).gather(1, next_action_indices)
+
+        targets = rewards + (gamma * next_q_values * (1 - dones))
+
+    return states, actions, targets
+
+
+def benchmark_model(policy_net: YahtzeeNet, device):
+    policy_net.to(device)
+    policy_net.eval()
+    self_play_fast(
+        policy_net, device=device, epsilon=0.0, plot_stats=True, games_to_play=1000
     )
 
-    # Save example
-    save_model(model, "/tmp/yahtzee_net.pth")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Yahtzee AI Training and Evaluation")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="train",
+        choices=["train", "benchmark"],
+        help="Mode to run: train or benchmark",
+    )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default="",
+        help="Path to load/save the model",
+    )
+    parser.add_argument(
+        "--start-iter",
+        type=int,
+        default=0,
+        help="Starting iteration for training (used for loading checkpoints)",
+    )
+    args = parser.parse_args()
+    input_size = DICE_VALUES + CATEGORIES + UPPER_SECTION_FIELDS + ROLLS_LEFT
+    # Actions
+    SELECT_CATEGORY = CATEGORIES - 1  # Bonus is not selectable
+    ROLL_DICE = 32
+    action_size = SELECT_CATEGORY + ROLL_DICE
+    device = (
+        torch.accelerator.current_accelerator().type
+        if torch.accelerator.is_available()
+        else "cpu"
+    )
+    policy_net = YahtzeeNet(input_size, action_size)
+    target_net = YahtzeeNet(input_size, action_size)
+    if args.model_path:
+        policy_net.load_state_dict(torch.load(args.model_path))
+        target_net.load_state_dict(policy_net.state_dict())
+
+    if args.mode == "train":
+        trained_model = train_from_scratch(
+            policy_net,
+            target_net,
+            torch.accelerator.current_accelerator().type
+            if torch.accelerator.is_available()
+            else "cpu",
+            start_iter=args.start_iter,
+        )
+    if args.mode == "benchmark":
+        benchmark_model(
+            policy_net,
+            torch.accelerator.current_accelerator().type
+            if torch.accelerator.is_available()
+            else "cpu",
+        )

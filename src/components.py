@@ -1,17 +1,59 @@
 import tkinter as tk
 
 
+def enable_neural_network_button(app):
+    def enable_nn():
+        # Attempt to load model
+        if app.game.load_model():
+            app.nn_button.config(state="disabled", text="AI Active")
+            app.ai_label.config(text="AI initialized. Roll to start.")
+            # Trigger initial suggestion if game is in progress
+            update_ai_suggestion(app)
+        else:
+            app.ai_label.config(text="Model not found in models/")
+
+    app.nn_button = tk.Button(
+        app.window, text="Enable Neural Network", command=enable_nn
+    )
+    app.nn_button.pack(pady=5)
+
+    # Label to display AI suggestions
+    app.ai_label = tk.Label(
+        app.window,
+        text="AI Suggestions: Off",
+        font=("Helvetica", 12, "bold"),
+        fg="blue",
+    )
+    app.ai_label.pack(pady=5)
+
+
+def update_ai_suggestion(app):
+    """Queries the AI and updates the suggestion label."""
+    if app.game.neural_network:
+        if app.game.rolls_left < 3:
+            suggestion = app.game.get_ai_prediction()
+            app.ai_label.config(text=f"AI Suggests: {suggestion}")
+        else:
+            app.ai_label.config(text="AI Suggestions: Roll to start")
+
+
 def roll_button(app):
     def roll_dice():
         app.game.roll_dice()
         dice = app.game.dice
         for i, value in enumerate(dice):
             app.dice_buttons[i].config(text=str(value))
-            if app.game.rolls_left == 2:
+            if app.game.rolls_left == 2:  # First roll of turn
                 app.dice_buttons[i].config(state="normal", bg="white")
             elif app.game.rolls_left == 0:
                 app.dice_buttons[i].config(state="disabled", bg="white")
+
+        if app.game.rolls_left == 2:
+            for btn in app.dice_buttons:
+                btn.config(borderwidth=2, relief="flat")
+
         _update_scores(app)
+        update_ai_suggestion(app)
 
     app.roll_button = tk.Button(app.window, text="Roll Dice", command=roll_dice)
     app.roll_button.pack(pady=10)
@@ -48,13 +90,16 @@ def category_frame(app):
         app.game.select_category(category)
         _update_scores(app)
         _reset_dice(app)
+        update_ai_suggestion(app)
 
     frame = tk.Frame(app.window)
     frame.pack()
 
     app.category_buttons = []
     app.category_score_labels = []
-    for category in app.game.categories.keys():
+
+    # Use keys from game instance to ensure order matching
+    for category in app.game.category_names:
         category_frame = tk.Frame(frame)
         category_frame.pack(pady=1)
         if category == "bonus":
@@ -71,6 +116,7 @@ def category_frame(app):
             app.upper_categories_label.pack(pady=1)
             app.bonus_label.pack(pady=1)
             continue
+
         button = tk.Button(
             category_frame,
             text=f"{category.replace('_', ' ').title()}: 0",
@@ -98,21 +144,39 @@ def total_score_label(app):
 
 def _update_scores(app):
     """Update the categories buttons"""
-    i = 0
-    for category, value in app.game.categories.items():
-        if category == "bonus":
+    # Map button list index to category names, skipping bonus logic which is handled separately in layout
+    # app.category_buttons contains 15 buttons (0-14).
+    # game.category_names has 16 items. 'bonus' is index 15.
+
+    cat_idx = 0
+    for name in app.game.category_names:
+        value = app.game.categories[name]
+
+        if name == "bonus":
             app.upper_categories_label.config(
                 text=f"Upper Section: {app.game.get_upper_section_score()}"
             )
             app.bonus_label.config(text=f"Bonus: {value if value is not None else 0}")
             continue
 
-        button = app.category_buttons[i]
-        score = app.game.calculate_score(category)
-        button.config(text=f"{category.replace('_', ' ').title()}: {score}")
-        app.category_score_labels[i].config(text=str(value if value is not None else 0))
-        button.config(state="normal" if value is None else "disabled")
-        i += 1
+        button = app.category_buttons[cat_idx]
+        score_preview = app.game.calculate_score(name)
+
+        # If value is set (played), show that. Else show preview of current dice
+        display_score = value if value is not None else score_preview
+
+        button.config(text=f"{name.replace('_', ' ').title()}: {display_score}")
+        app.category_score_labels[cat_idx].config(
+            text=str(value if value is not None else 0)
+        )
+
+        # Enable button only if not played and game not over
+        if value is None:
+            button.config(state="normal")
+        else:
+            button.config(state="disabled")
+
+        cat_idx += 1
 
     # Update overall score
     app.score_label.config(text=f"Total Score: {app.game.get_score()}")
