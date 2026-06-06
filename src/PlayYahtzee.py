@@ -12,8 +12,8 @@ from Yahtzee import Yahtzee
 
 class YahtzeeApp:
     def __init__(self, root):
-        self.window = root
-        self.window.title("Yahtzee Game")
+        self.game_frame = root
+        self.game_frame.title("Yahtzee Game")
         self.game = Yahtzee()
 
         self.init()

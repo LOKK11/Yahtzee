@@ -1,139 +1,145 @@
 import random
 import torch
-import numpy as np
-from YahtzeeAI import YahtzeeNet
+from YahtzeeAI import (
+    RollPolicyNet,
+    MultiCategoryNet,
+    CategoryPolicyNet,
+    load_models,
+    ROLL_SPECIFIC_INPUTS,
+    DICE_VALUES,
+    ROLLS_LEFT,
+    CATEGORY_ACTIONS,
+)
+from YahtzeeFast import YahtzeeFast
 
-MODEL = "models/avg200.pth"
+MODEL = "models/best_model.pth"
+MULTI_MODEL = "models/multi_category_net_2.pth"
 
 
 class Yahtzee:
     def __init__(self):
+        self.device = torch.device("cpu")
+        self.fast_env = YahtzeeFast(batch_size=1, device=self.device)
+
         self.dice = [0] * 5
         self.locked = []
         self.rolls_left = 3
-        # Use a list for categories to maintain index order 0-15 matching the AI
-        self.category_names = [
-            "ones",
-            "twos",
-            "threes",
-            "fours",
-            "fives",
-            "sixes",
-            "two_of_a_kind",
-            "two_pairs",
-            "three_of_a_kind",
-            "four_of_a_kind",
-            "full_house",
-            "small_straight",
-            "large_straight",
-            "yahtzee",
-            "chance",
-            "bonus",
-        ]
+        self.category_names = self.fast_env.CATEGORY_NAMES
+
         self.categories = {name: None for name in self.category_names}
         self.categories_played = 0
         self.neural_network = False
-        self.model = None
-        self.device = torch.device("cpu")
+        self.roll_policy_net = None
+        self.category_policy_net = None
+        self.multi_category_model = None
 
-        # Roll Action Masks (copied from YahtzeeFast for decoding AI moves)
-        self.roll_action_masks = np.zeros((32, 5), dtype=bool)
-        for i in range(32):
-            for bit in range(5):
-                if (i >> bit) & 1:
-                    self.roll_action_masks[i, bit] = True
-
-    def load_model(self):
-        """Loads the latest model from the models directory."""
+    def load_models(self):
+        """Loads the latest model architecture."""
         try:
-            input_dim = (
-                62  # 30 (dice) + 16 (categories) + 13 (upper score) + 3 (rolls left)
+            self.roll_policy_net = RollPolicyNet()
+            self.category_policy_net = CategoryPolicyNet()
+            self.multi_category_model = MultiCategoryNet()
+            load_models(
+                self.roll_policy_net,
+                self.category_policy_net,
+                MODEL,
+                device=self.device,
             )
-            output_dim = 47  # 15 categories + 32 roll combinations
-
-            self.model = YahtzeeNet(input_dim, output_dim)
-            self.model.load_state_dict(torch.load(MODEL, map_location=self.device))
-            self.model.eval()
+            self.multi_category_model.load_state_dict(
+                torch.load(MULTI_MODEL, map_location=self.device)
+            )
+            self.roll_policy_net.eval()
+            self.multi_category_model.eval()
             self.neural_network = True
             print(f"Loaded model: {MODEL}")
+            print(f"Loaded multi-category model: {MULTI_MODEL}")
             return True
         except Exception as e:
             print(f"Failed to load model: {e}")
             return False
 
-    def get_encoded_state(self):
-        """Encodes the current state into a tensor (1, 62) for the AI."""
-        encoded = np.zeros((1, 62), dtype=np.float32)
+    def sync_to_fast_env(self):
+        """Updates the internal fast_env state to match current game state."""
+        # Update Dice
+        self.fast_env.dice = torch.tensor(
+            [self.dice], dtype=torch.long, device=self.device
+        )
 
-        current_dice = np.array(self.dice)
-        if np.sum(current_dice) > 0:
-            val_offsets = (current_dice - 1) * 5
-            pos_indices = np.arange(5)
-            flat_indices = val_offsets + pos_indices
-            encoded[0, flat_indices] = 1.0
-
+        # Update Scores (Map None to -1)
+        score_tensor = torch.full((1, 16), -1, dtype=torch.float32, device=self.device)
         for i, name in enumerate(self.category_names):
-            if self.categories[name] is not None:
-                encoded[0, 30 + i] = 1.0
-
-        # 3. Upper Section Score (13 inputs)
-        # Calculate upper score
-        upper_score = 0
-        for name in self.category_names[:6]:
             val = self.categories[name]
-            if val is not None:
-                upper_score += val
+            score_tensor[0, i] = val if val is not None else -1
+        self.fast_env.scores = score_tensor
 
-        upper_score = min(upper_score, 63)
-        upper_bucket = int(upper_score // (63 / 12))
-        encoded[0, 46 + upper_bucket] = 1.0
-
-        encoded[0, 59 + self.rolls_left] = 1.0
-
-        return torch.tensor(encoded, dtype=torch.float32).to(self.device)
-
-    def get_action_mask(self):
-        """Returns boolean mask for valid actions."""
-        mask = torch.zeros((1, 47), dtype=torch.bool)
-
-        can_pick_category = self.rolls_left == 0
-
-        if not can_pick_category:
-            mask[0, 15:] = True
-        else:
-            for i in range(15):
-                if self.categories[self.category_names[i]] is None:
-                    mask[0, i] = True
-
-        return mask
+        self.fast_env.rolls_left = self.rolls_left
 
     def get_ai_prediction(self):
-        """Returns the best action string description."""
-        if not self.model or not self.neural_network:
+        """Returns a ranked list of all categories and their best roll actions."""
+        if (
+            not self.roll_policy_net
+            or not self.category_policy_net
+            or not self.multi_category_model
+            or not self.neural_network
+        ):
             return ""
 
-        state = self.get_encoded_state()
-        mask = self.get_action_mask()
+        self.sync_to_fast_env()
+        if self.rolls_left != 0:
+            state = self.fast_env.get_encoded_state()
+            policy_net = self.roll_policy_net
+        else:
+            state = self.fast_env.get_encoded_state()[:, ROLL_SPECIFIC_INPUTS:]
+            policy_net = self.category_policy_net
+        category_mask = self.fast_env.get_category_action_masks()
+        roll_mask = self.fast_env.get_roll_action_masks()
 
         with torch.no_grad():
-            q_values = self.model(state)
-            q_values = q_values.masked_fill(~mask, -1e12)
-            action_idx = q_values.argmax().item()
+            # 1. Get Q-values for all categories
+            q_values = policy_net(state)
 
-        # Decode Action
-        if action_idx < 15:
-            cat_name = self.category_names[action_idx].replace("_", " ").title()
-            return f"Pick Category: {cat_name}"
-        else:
-            roll_mask_idx = action_idx - 15
-            keep_mask = self.roll_action_masks[roll_mask_idx]
+            # Mask out already played categories
+            q_values = q_values.masked_fill(~category_mask, -1e12)
 
-            keep_indices = [i + 1 for i, keep in enumerate(keep_mask) if keep]
+            # 2. Get indices of categories sorted by Q-value (descending)
+            sorted_indices = torch.argsort(q_values, descending=True, dim=1)[0]
 
-            if not keep_indices:
-                return "Roll Again (Keep None)"
-            else:
-                return f"Roll Again (Keep positions: {keep_indices})"
+            results = []
+            # 3. For each category, find what the best roll action would be
+            for idx in sorted_indices:
+                idx_item = idx.item()
+                # If Q-value is very low, it's likely masked/invalid
+                if q_values[0, idx_item] < -1e11:
+                    continue
+
+                cat_name = self.category_names[idx_item].replace("_", " ").title()
+
+                if self.rolls_left == 0:
+                    results.append(f"Rank {len(results) + 1}: {cat_name}")
+                else:
+                    # Query multi-category model for this specific category
+                    cat_tensor = torch.tensor([idx_item], device=self.device)
+                    roll_q_values = self.multi_category_model(
+                        state[:, : DICE_VALUES + ROLLS_LEFT], cat_tensor
+                    )
+                    roll_q_values = roll_q_values.masked_fill(~roll_mask, -1e12)
+                    roll_action = roll_q_values.argmax(dim=1)
+
+                    # Decode roll action
+                    target_counts = self.fast_env.keep_combinations[roll_action][0]
+                    keep_desc = []
+                    for face in range(1, 7):
+                        count = target_counts[face].item()
+                        if count == 5:
+                            keep_desc = ["All"]
+                            break
+                        if count > 0:
+                            keep_desc.append(f"{count}x{face}")
+
+                    keep_str = ", ".join(keep_desc) if keep_desc else "None"
+                    results.append(f"{cat_name}: Keep {keep_str}")
+
+        return "\n".join(results)
 
     def roll_dice(self):
         if self.rolls_left == 3:

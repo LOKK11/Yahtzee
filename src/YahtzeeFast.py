@@ -1,4 +1,5 @@
 import torch
+from itertools import combinations_with_replacement
 
 
 class YahtzeeFast:
@@ -28,19 +29,45 @@ class YahtzeeFast:
             "chance",
             "bonus",
         ]
-
-        # Action Constants
-        self.CAT_ACTIONS = 15
-        self.ROLL_ACTIONS = 32
-
-        # Precompute roll action masks
-        self.roll_action_masks = torch.zeros(
-            (32, 5), dtype=torch.bool, device=self.device
+        self.max_scores = torch.tensor(
+            [
+                5,  # Ones
+                10,  # Twos
+                15,  # Threes
+                20,  # Fours
+                25,  # Fives
+                30,  # Sixes
+                12,  # Two of a kind
+                22,  # Two pairs
+                18,  # Three of a kind
+                24,  # Four of a kind
+                28,  # Full house
+                15,  # Small straight
+                20,  # Large straight
+                50,  # Yahtzee
+                30,  # Chance
+            ],
+            dtype=torch.float32,
+            device=self.device,
         )
-        for i in range(self.ROLL_ACTIONS):
-            for bit in range(5):
-                if (i >> bit) & 1:
-                    self.roll_action_masks[i, bit] = True
+
+        self.keep_combinations = []
+        for r in range(5):
+            for combo in combinations_with_replacement(range(1, 7), r):
+                counts = torch.zeros(7, dtype=torch.long, device=self.device)
+                for val in combo:
+                    counts[val] += 1
+                self.keep_combinations.append(counts)
+
+        # Full keep (5 dice)
+        self.keep_combinations.append(
+            torch.fill(torch.zeros(7, dtype=torch.long, device=self.device), 5)
+        )
+
+        self.keep_combinations = torch.stack(self.keep_combinations)
+
+        self.ROLL_ACTIONS = len(self.keep_combinations)
+        self.CAT_ACTIONS = 15
 
         self.reset()
 
@@ -57,6 +84,19 @@ class YahtzeeFast:
         self.rolls_left = 2
         # Mask for completed games
         self.finished = False
+
+    def get_final_scores(self):
+        return torch.where(self.scores == -1, 0, self.scores).sum(
+            dim=1, dtype=torch.float32
+        )
+
+    def get_average_final_score(self):
+        return (
+            torch.where(self.scores == -1, 0, self.scores)
+            .sum(dim=1, dtype=torch.float32)
+            .mean()
+            .item()
+        )
 
     def roll_dice(self, hold_masks):
         """
@@ -147,40 +187,39 @@ class YahtzeeFast:
 
         return scores
 
-    def step(self, actions):
+    def step(self, actions, action_type):
         """
         Advances the game state based on actions.
         actions: (N,) int array of action indices.
         Returns:
-            states (tensor),
-            rewards (float array),
-            dones (bool array),
-            infos (dict)
+            rewards: (N,) float array of rewards received from the action.
         """
-        is_category_action = actions[0] < self.CAT_ACTIONS
-        is_roll_action = actions[0] >= self.CAT_ACTIONS
-
-        rewards = torch.zeros(self.n, dtype=torch.float32, device=self.device)
+        rewards = None
 
         # --- Handle Roll Actions ---
-        if is_roll_action:
-            # Convert action ID to 0-31 range
-            roll_action_ids = actions - self.CAT_ACTIONS
+        if action_type == "roll":
+            target_counts = self.keep_combinations[actions]
 
-            masks = self.roll_action_masks[roll_action_ids]
+            current_dice = self.dice
+            hold_masks = torch.zeros_like(current_dice, dtype=torch.bool)
 
-            new_rolls = torch.randint(
-                1, 7, size=(len(actions), self.NUM_DICE), device=self.device
-            )
+            for v in range(1, 7):
+                v_needed = target_counts[:, v]
 
-            # Apply hold mask
-            updated_dice = torch.where(masks, self.dice, new_rolls)
-            self.dice = updated_dice
+                is_v = current_dice == v
 
+                # Use cumulative sum to identify the 1st, 2nd, 3rd... instance of value 'v'
+                v_rank = torch.cumsum(is_v.to(torch.long), dim=1)
+
+                # Keep the die if it is value 'v' AND its rank is <= number we need
+                hold_masks |= is_v & (v_rank <= v_needed.unsqueeze(1))
+
+            new_rolls = torch.randint(1, 7, size=current_dice.shape, device=self.device)
+            self.dice = torch.where(hold_masks, current_dice, new_rolls)
             self.rolls_left -= 1
 
         # --- Handle Category Actions ---
-        elif is_category_action:
+        elif action_type == "category":
             bonuses_before = torch.where(
                 self.scores[:, 15] == -1, 0, self.scores[:, 15]
             )
@@ -203,74 +242,139 @@ class YahtzeeFast:
             rewards += bonuses_after - bonuses_before
 
             # Reset Dice and Rolls for next turn
-            self.rolls_left = 3
+            self.rolls_left = 2
             self.dice = torch.randint(
                 1, 7, size=(self.n, self.NUM_DICE), device=self.device
             )
-            self.rolls_left -= 1
 
-        # --- Check Game Over ---
-        # Game over if all first 15 categories (0-14) are played (score != -1)
-        played_count = (self.scores[0, 0:15] != -1).sum()
-        finished = played_count == 15
+        return rewards
 
-        if finished:
-            dones = torch.ones(self.n, dtype=torch.float32, device=self.device)
-            average_final_score = self.scores.sum(dim=1, dtype=torch.float32).mean()
-        else:
-            dones = torch.zeros(self.n, dtype=torch.float32, device=self.device)
-            average_final_score = 0.0
+    def get_category_action_masks(self):
+        mask = self.scores[:, :15] == -1
+        if self.rolls_left > 0:
+            mask[:, :14] = True
+            mask[:, 14] = False
 
-        return rewards, dones, average_final_score
+        return mask
 
-    def get_action_masks(self):
-        """
-        Returns boolean mask (N, ACTION_SIZE)
-        True = Valid action, False = Invalid
-        """
-        total_actions = self.CAT_ACTIONS + self.ROLL_ACTIONS
-        mask = torch.zeros(
-            (self.n, total_actions), dtype=torch.bool, device=self.device
+    def get_roll_action_masks(self):
+        dice_one_hot = torch.nn.functional.one_hot(self.dice, num_classes=7)
+        hand_counts = dice_one_hot.sum(dim=1)  # (N, 7)
+
+        mask = (self.keep_combinations.unsqueeze(0) <= hand_counts.unsqueeze(1)).all(
+            dim=2
         )
-
-        can_roll = self.rolls_left > 0
-        if not can_roll:
-            # 1. Category Actions (0-14)
-            mask[:, :15] = self.scores[:, :15] == -1
-        else:
-            # 2. Roll Actions (15-46)
-            mask[:, 15:47] = True
+        mask[:, -1] = True  # Always allow full keep
 
         return mask
 
     def get_encoded_state(self):
         """
         Returns the state tensor compatible with YahtzeeNet.
-        Shape: (N, 62)
+        Shape: (N, 84)
         """
-        encoded = torch.zeros((self.n, 62), dtype=torch.float32, device=self.device)
+        encoded = torch.zeros((self.n, 84), dtype=torch.float32, device=self.device)
 
-        # 1. Dice Values (30 inputs)
-        pos_indices = torch.tile(torch.arange(5, device=self.device), (self.n, 1))
-        val_offsets = (self.dice - 1) * 5
-        flat_indices = val_offsets + pos_indices
-        row_indices = torch.arange(self.n, device=self.device)[:, torch.newaxis]
-        encoded[row_indices, flat_indices] = 1.0
+        # 1. Dice Values (41 inputs)
+        dice_one_hot = torch.nn.functional.one_hot(self.dice - 1, num_classes=6)
+        counts = dice_one_hot.sum(dim=1)
+        highest_counts, _ = counts.max(dim=1)
 
-        # 2. Categories Played (16 inputs)
+        for val_idx in range(6):
+            val_counts = counts[:, val_idx].long()
+            row_indices = torch.arange(self.n, device=self.device)
+            col_indices = val_idx * 6 + val_counts
+            encoded[row_indices, col_indices] = 1.0
+
+        encoded[torch.arange(self.n), 35 + highest_counts] = 1.0
+
+        # 2. Rolls Left (3 inputs)
+        rl = self.rolls_left
+        encoded[torch.arange(self.n), 41 + rl] = 1.0
+
+        # 3. Normalized score yields (15 inputs)
+        not_played = (self.scores[:, :15] == -1).to(torch.float32)
+        all_scores = self.get_potential_scores()[:, :15] * not_played
+        normalized_scores = all_scores / self.max_scores
+        encoded[:, 44:59] = normalized_scores
+
+        # 4. Would yield bonus (6 inputs)
+        would_yield_bonus = torch.zeros(
+            (self.n, 6), dtype=torch.float32, device=self.device
+        )
+        for i in range(6):
+            upper_vals = self.scores[:, 0:6].clone()
+            mask = torch.where(upper_vals > -1, upper_vals, 0).sum(dim=1) < 63
+            mask &= upper_vals[:, i] == -1
+            upper_vals[:, i] = torch.where(
+                mask,
+                self.get_potential_scores()[:, i],
+                upper_vals[:, i],
+            )
+            new_upper_score = torch.where(upper_vals > -1, upper_vals, 0).sum(dim=1)
+            would_yield_bonus[:, i] = ((new_upper_score >= 63) & mask).to(torch.float32)
+        encoded[:, 59:65] = would_yield_bonus
+
+        # 5. Categories Played (16 inputs)
         is_played = (self.scores != -1).to(torch.float32)
-        encoded[:, 30:46] = is_played
+        encoded[:, 65:81] = is_played
 
-        # 3. Upper Section Score (13 inputs)
+        # 6. Normalized Upper Section Score (1 input)
         upper_vals = self.scores[:, 0:6]
         upper_score = torch.where(upper_vals > -1, upper_vals, 0).sum(dim=1)
-        upper_score = torch.clamp(upper_score, 0, 63) // (63 / 12)
-        mask = torch.zeros((self.n, 13), dtype=torch.float32, device=self.device)
-        mask[torch.arange(self.n), upper_score.to(torch.int32)] = 1.0
-        encoded[:, 46:59] = mask
+        encoded[:, 81] = torch.clamp(upper_score, max=63) / 63.0
 
-        # 4. Rolls Left (3 inputs)
-        rl = self.rolls_left
-        encoded[torch.arange(self.n), 59 + rl] = 1.0
+        # 7. Normalized Categories Played (1 input)
+        categories_played = (self.scores[:, :15] != -1).sum(dim=1)
+        encoded[:, 82] = categories_played / 15.0
 
+        # 8. Bonus available (1 input)
+        max_possible_upper_score = torch.where(
+            upper_vals > -1, upper_vals, self.max_scores[0:6]
+        ).sum(dim=1)
+        bonus_available = (upper_score < 63) & (max_possible_upper_score >= 63)
+        encoded[:, 83] = bonus_available.to(torch.float32)
         return encoded
+
+    @torch.no_grad()
+    def analyze_batch_stats(
+        self, all_roll_actions, all_category_actions, all_rewards, max_score_bins=51
+    ):
+        """
+        Vectorized calculation of game statistics.
+        all_actions: Tensor of all actions taken in self-play (Steps * N)
+        all_rewards: Tensor of all rewards received (Steps * N)
+        """
+        stats = {}
+
+        # 1. Roll Action Distribution (Actions 15-end)
+        stats["roll_counts"] = torch.bincount(
+            all_roll_actions, minlength=self.ROLL_ACTIONS
+        ).cpu()
+
+        # 2. Category Reward Distributions (Actions 0-14)
+        cat_stats = []
+        for i in range(15):
+            cat_mask = all_category_actions == i
+            cat_rewards = all_rewards[cat_mask].long()
+            if i < 6:
+                cat_rewards = torch.where(
+                    cat_rewards > 30, cat_rewards - 50, cat_rewards
+                )
+            # Clamp to prevent index errors, though rewards should be in range
+            cat_rewards = torch.clamp(cat_rewards, 0, max_score_bins - 1)
+            dist = torch.bincount(cat_rewards, minlength=max_score_bins).cpu()
+            cat_stats.append(dist)
+        stats["cat_distributions"] = cat_stats
+
+        # 3. Special Totals
+        # Yahtzee is action 13 with reward 50
+        stats["yahtzee_count"] = (
+            ((all_category_actions == 13) & (all_rewards == 50)).sum().item()
+        )
+        # Bonus is reward > 50 for upper section actions (0-5)
+        stats["bonus_count"] = (
+            ((all_category_actions < 6) & (all_rewards > 30)).sum().item()
+        )
+
+        return stats

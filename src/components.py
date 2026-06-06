@@ -2,29 +2,62 @@ import tkinter as tk
 
 
 def enable_neural_network_button(app):
+    # Create a side-bar layout
+    app.main_container = tk.Frame(app.game_frame)
+    app.main_container.pack(fill="both", expand=True)
+
+    # Left frame for AI
+    app.ai_frame = tk.Frame(
+        app.main_container, width=250, padx=10, relief="sunken", borderwidth=1
+    )
+    app.ai_frame.pack(side=tk.LEFT, fill="y")
+
+    # Right frame for Game
+    app.game_frame = tk.Frame(app.main_container, padx=10)
+    app.game_frame.pack(side=tk.RIGHT, fill="both", expand=True)
+
     def enable_nn():
-        # Attempt to load model
-        if app.game.load_model():
+        if app.game.load_models():
             app.nn_button.config(state="disabled", text="AI Active")
-            app.ai_label.config(text="AI initialized. Roll to start.")
-            # Trigger initial suggestion if game is in progress
+            app.ai_label.config(text="AI initialized.\nRoll to start.")
             update_ai_suggestion(app)
         else:
             app.ai_label.config(text="Model not found in models/")
 
     app.nn_button = tk.Button(
-        app.window, text="Enable Neural Network", command=enable_nn
+        app.game_frame, text="Enable Neural Network", command=enable_nn
     )
     app.nn_button.pack(pady=5)
 
-    # Label to display AI suggestions
+    # Label to display AI suggestions (Moved to Left Frame)
     app.ai_label = tk.Label(
-        app.window,
+        app.ai_frame,
         text="AI Suggestions: Off",
-        font=("Helvetica", 12, "bold"),
+        font=("Helvetica", 10),
         fg="blue",
+        justify=tk.LEFT,
+        anchor="nw",
     )
-    app.ai_label.pack(pady=5)
+    app.ai_label.pack(pady=20, fill="both")
+
+
+def roll_button(app):
+    def roll_dice():
+        app.game.roll_dice()
+        dice = app.game.dice
+        for i, value in enumerate(dice):
+            app.dice_buttons[i].config(text=str(value))
+            if app.game.rolls_left == 2:
+                app.dice_buttons[i].config(state="normal", bg="white")
+            elif app.game.rolls_left == 0:
+                app.dice_buttons[i].config(state="disabled", bg="white")
+
+        _update_scores(app)
+        update_ai_suggestion(app)
+
+    # Pack into game_frame instead of window
+    app.roll_button = tk.Button(app.game_frame, text="Roll Dice", command=roll_dice)
+    app.roll_button.pack(pady=10)
 
 
 def update_ai_suggestion(app):
@@ -35,28 +68,6 @@ def update_ai_suggestion(app):
             app.ai_label.config(text=f"AI Suggests: {suggestion}")
         else:
             app.ai_label.config(text="AI Suggestions: Roll to start")
-
-
-def roll_button(app):
-    def roll_dice():
-        app.game.roll_dice()
-        dice = app.game.dice
-        for i, value in enumerate(dice):
-            app.dice_buttons[i].config(text=str(value))
-            if app.game.rolls_left == 2:  # First roll of turn
-                app.dice_buttons[i].config(state="normal", bg="white")
-            elif app.game.rolls_left == 0:
-                app.dice_buttons[i].config(state="disabled", bg="white")
-
-        if app.game.rolls_left == 2:
-            for btn in app.dice_buttons:
-                btn.config(borderwidth=2, relief="flat")
-
-        _update_scores(app)
-        update_ai_suggestion(app)
-
-    app.roll_button = tk.Button(app.window, text="Roll Dice", command=roll_dice)
-    app.roll_button.pack(pady=10)
 
 
 def dice_buttons(app):
@@ -71,7 +82,7 @@ def dice_buttons(app):
 
     app.dice_buttons = [
         tk.Button(
-            app.window,
+            app.game_frame,
             text="0",
             font=("Helvetica", 24),
             command=lambda i=i: dice_action(i),
@@ -92,7 +103,7 @@ def category_frame(app):
         _reset_dice(app)
         update_ai_suggestion(app)
 
-    frame = tk.Frame(app.window)
+    frame = tk.Frame(app.game_frame)
     frame.pack()
 
     app.category_buttons = []
@@ -137,7 +148,7 @@ def category_frame(app):
 
 def total_score_label(app):
     app.score_label = tk.Label(
-        app.window, text="Total Score: 0", font=("Helvetica", 16)
+        app.game_frame, text="Total Score: 0", font=("Helvetica", 16)
     )
     app.score_label.pack(pady=10)
 
