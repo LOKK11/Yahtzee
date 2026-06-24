@@ -5,7 +5,7 @@ train:
 	python src/YahtzeeAI.py --start-iter 0 --model-path models/best_model.pth
 
 train_ensemble:
-	python src/YahtzeeAI.py --start-iter 0 --mode train_ensemble
+	python src/YahtzeeAI.py --start-iter 0 --mode train_ensemble --model-path models/best_model_ensemble.pth
 
 benchmark:
 	python src/YahtzeeAI.py --mode benchmark --model-path models/best_model.pth

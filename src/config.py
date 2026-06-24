@@ -1,0 +1,50 @@
+DICE_VALUES = 36
+ROLLS_LEFT = 3
+NORMALIZED_SCORE_YIELDS = 15
+BONUS_YIELDS = 6
+
+CATEGORIES_PLAYED = 16
+NORMALIZED_UPPER_SECTION_SCORE = 1
+NORMALIZED_CATEGORIES_PLAYED = 1
+NORMALIZED_UPPER_CATEGORIES_PLAYED = 1
+BONUS_AVAILABLE = 1
+
+ROLL_SPECIFIC_INPUTS = DICE_VALUES + ROLLS_LEFT
+
+COMMON_INPUTS = (
+    NORMALIZED_SCORE_YIELDS
+    + BONUS_YIELDS
+    + CATEGORIES_PLAYED
+    + NORMALIZED_UPPER_SECTION_SCORE
+    + NORMALIZED_CATEGORIES_PLAYED
+    + BONUS_AVAILABLE
+)
+
+ROLL_ACTIONS = 211  # 211 possible hold patterns
+CATEGORY_ACTIONS = 15  # 15 categories to choose from
+
+ROUNDS_IN_GAME = 15
+
+ROLL_EXAMPLES_PER_GAME = 2 * ROUNDS_IN_GAME
+CATEGORY_EXAMPLES_PER_GAME = ROUNDS_IN_GAME
+
+ROLL = "roll"
+CATEGORY = "category"
+
+CATREGORY_NAMES = [
+    "Ones",
+    "Twos",
+    "Threes",
+    "Fours",
+    "Fives",
+    "Sixes",
+    "Two of a kind",
+    "Two pairs",
+    "Three of a kind",
+    "Four of a kind",
+    "Full house",
+    "Small straight",
+    "Large straight",
+    "Yahtzee",
+    "Chance",
+]

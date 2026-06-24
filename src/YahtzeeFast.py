@@ -68,14 +68,13 @@ class YahtzeeFast:
 
         self.ROLL_ACTIONS = len(self.keep_combinations)
         self.CAT_ACTIONS = 15
+        self.ENCODED_STATE_SIZE = 36 + 3 + 15 + 6 + 16 + 1 + 1 + 1
 
         self.reset()
 
     def reset(self):
         """Resets all games in the batch."""
-        self.dice = torch.randint(
-            1, 7, size=(self.n, self.NUM_DICE), device=self.device
-        )
+        self.dice = torch.randint(1, 7, size=(self.n, self.NUM_DICE), device=self.device)
 
         self.scores = torch.full(
             (self.n, self.NUM_CATEGORIES), -1, dtype=torch.float32, device=self.device
@@ -85,10 +84,24 @@ class YahtzeeFast:
         # Mask for completed games
         self.finished = False
 
+    def get_action_string(self, action_idx, action_type):
+        if action_type == "roll":
+            if action_idx == self.ROLL_ACTIONS - 1:
+                return "Keep All"
+            if action_idx == 0:
+                return "Reroll All"
+            target_counts = self.keep_combinations[action_idx]
+            keep_desc = []
+            for face in range(1, 7):
+                count = target_counts[face].item()
+                if count > 0:
+                    keep_desc.append(f"{count}x{face}")
+            return "Keep " + ", ".join(keep_desc)
+        else:
+            return f"{self.CATEGORY_NAMES[action_idx].replace('_', ' ').title()}"
+
     def get_final_scores(self):
-        return torch.where(self.scores == -1, 0, self.scores).sum(
-            dim=1, dtype=torch.float32
-        )
+        return torch.where(self.scores == -1, 0, self.scores).sum(dim=1, dtype=torch.float32)
 
     def get_average_final_score(self):
         return (
@@ -98,14 +111,20 @@ class YahtzeeFast:
             .item()
         )
 
+    def get_average_final_score_ensemble(self, n_instances):
+        return (
+            torch.where(self.scores == -1, 0, self.scores)
+            .sum(dim=1, dtype=torch.float32)
+            .view(n_instances, -1)
+            .mean(dim=1)
+        )
+
     def roll_dice(self, hold_masks):
         """
         Rolls dice for all games.
         hold_masks: (N, 5) boolean array. True = Keep die, False = Reroll.
         """
-        new_rolls = torch.randint(
-            1, 7, size=(self.n, self.NUM_DICE), device=self.device
-        )
+        new_rolls = torch.randint(1, 7, size=(self.n, self.NUM_DICE), device=self.device)
         self.dice = torch.where(hold_masks, self.dice, new_rolls)
         self.rolls_left -= 1
 
@@ -114,14 +133,10 @@ class YahtzeeFast:
         Calculates the score for every category for the current dice state.
         Returns: (N, 16) array of scores.
         """
-        dice_one_hot = torch.nn.functional.one_hot(
-            self.dice, num_classes=7
-        )  # (N, 5, 7)
+        dice_one_hot = torch.nn.functional.one_hot(self.dice, num_classes=7)  # (N, 5, 7)
         counts = dice_one_hot.sum(dim=1)  # (N, 7)
 
-        scores = torch.zeros(
-            (self.n, self.NUM_CATEGORIES), dtype=torch.float32, device=self.device
-        )
+        scores = torch.zeros((self.n, self.NUM_CATEGORIES), dtype=torch.float32, device=self.device)
 
         # --- Upper Section ---
 
@@ -220,9 +235,7 @@ class YahtzeeFast:
 
         # --- Handle Category Actions ---
         elif action_type == "category":
-            bonuses_before = torch.where(
-                self.scores[:, 15] == -1, 0, self.scores[:, 15]
-            )
+            bonuses_before = torch.where(self.scores[:, 15] == -1, 0, self.scores[:, 15])
 
             # Calculate scores for current dice
             all_scores = self.get_potential_scores()  # (N, 16)
@@ -243,9 +256,7 @@ class YahtzeeFast:
 
             # Reset Dice and Rolls for next turn
             self.rolls_left = 2
-            self.dice = torch.randint(
-                1, 7, size=(self.n, self.NUM_DICE), device=self.device
-            )
+            self.dice = torch.randint(1, 7, size=(self.n, self.NUM_DICE), device=self.device)
 
         return rewards
 
@@ -261,9 +272,7 @@ class YahtzeeFast:
         dice_one_hot = torch.nn.functional.one_hot(self.dice, num_classes=7)
         hand_counts = dice_one_hot.sum(dim=1)  # (N, 7)
 
-        mask = (self.keep_combinations.unsqueeze(0) <= hand_counts.unsqueeze(1)).all(
-            dim=2
-        )
+        mask = (self.keep_combinations.unsqueeze(0) <= hand_counts.unsqueeze(1)).all(dim=2)
         mask[:, -1] = True  # Always allow full keep
 
         return mask
@@ -271,14 +280,15 @@ class YahtzeeFast:
     def get_encoded_state(self):
         """
         Returns the state tensor compatible with YahtzeeNet.
-        Shape: (N, 84)
+        Shape: (N, self.ENCODED_STATE_SIZE)
         """
-        encoded = torch.zeros((self.n, 84), dtype=torch.float32, device=self.device)
+        encoded = torch.zeros(
+            (self.n, self.ENCODED_STATE_SIZE), dtype=torch.float32, device=self.device
+        )
 
-        # 1. Dice Values (41 inputs)
+        # 1. Dice Values (36 inputs)
         dice_one_hot = torch.nn.functional.one_hot(self.dice - 1, num_classes=6)
         counts = dice_one_hot.sum(dim=1)
-        highest_counts, _ = counts.max(dim=1)
 
         for val_idx in range(6):
             val_counts = counts[:, val_idx].long()
@@ -286,22 +296,21 @@ class YahtzeeFast:
             col_indices = val_idx * 6 + val_counts
             encoded[row_indices, col_indices] = 1.0
 
-        encoded[torch.arange(self.n), 35 + highest_counts] = 1.0
-
+        idx = 36
         # 2. Rolls Left (3 inputs)
         rl = self.rolls_left
-        encoded[torch.arange(self.n), 41 + rl] = 1.0
+        encoded[torch.arange(self.n), idx + rl] = 1.0
 
+        idx += 3
         # 3. Normalized score yields (15 inputs)
         not_played = (self.scores[:, :15] == -1).to(torch.float32)
         all_scores = self.get_potential_scores()[:, :15] * not_played
         normalized_scores = all_scores / self.max_scores
-        encoded[:, 44:59] = normalized_scores
+        encoded[:, idx : idx + 15] = normalized_scores
 
+        idx += 15
         # 4. Would yield bonus (6 inputs)
-        would_yield_bonus = torch.zeros(
-            (self.n, 6), dtype=torch.float32, device=self.device
-        )
+        would_yield_bonus = torch.zeros((self.n, 6), dtype=torch.float32, device=self.device)
         for i in range(6):
             upper_vals = self.scores[:, 0:6].clone()
             mask = torch.where(upper_vals > -1, upper_vals, 0).sum(dim=1) < 63
@@ -313,27 +322,31 @@ class YahtzeeFast:
             )
             new_upper_score = torch.where(upper_vals > -1, upper_vals, 0).sum(dim=1)
             would_yield_bonus[:, i] = ((new_upper_score >= 63) & mask).to(torch.float32)
-        encoded[:, 59:65] = would_yield_bonus
+        encoded[:, idx : idx + 6] = would_yield_bonus
+        idx += 6
 
         # 5. Categories Played (16 inputs)
         is_played = (self.scores != -1).to(torch.float32)
-        encoded[:, 65:81] = is_played
+        encoded[:, idx : idx + 16] = is_played
+        idx += 16
 
         # 6. Normalized Upper Section Score (1 input)
         upper_vals = self.scores[:, 0:6]
         upper_score = torch.where(upper_vals > -1, upper_vals, 0).sum(dim=1)
-        encoded[:, 81] = torch.clamp(upper_score, max=63) / 63.0
+        encoded[:, idx] = torch.clamp(upper_score, max=63) / 63.0
+        idx += 1
 
         # 7. Normalized Categories Played (1 input)
         categories_played = (self.scores[:, :15] != -1).sum(dim=1)
-        encoded[:, 82] = categories_played / 15.0
+        encoded[:, idx] = categories_played / 15.0
+        idx += 1
 
         # 8. Bonus available (1 input)
         max_possible_upper_score = torch.where(
             upper_vals > -1, upper_vals, self.max_scores[0:6]
         ).sum(dim=1)
         bonus_available = (upper_score < 63) & (max_possible_upper_score >= 63)
-        encoded[:, 83] = bonus_available.to(torch.float32)
+        encoded[:, idx] = bonus_available.to(torch.float32)
         return encoded
 
     @torch.no_grad()
@@ -348,9 +361,7 @@ class YahtzeeFast:
         stats = {}
 
         # 1. Roll Action Distribution (Actions 15-end)
-        stats["roll_counts"] = torch.bincount(
-            all_roll_actions, minlength=self.ROLL_ACTIONS
-        ).cpu()
+        stats["roll_counts"] = torch.bincount(all_roll_actions, minlength=self.ROLL_ACTIONS).cpu()
 
         # 2. Category Reward Distributions (Actions 0-14)
         cat_stats = []
@@ -358,9 +369,7 @@ class YahtzeeFast:
             cat_mask = all_category_actions == i
             cat_rewards = all_rewards[cat_mask].long()
             if i < 6:
-                cat_rewards = torch.where(
-                    cat_rewards > 30, cat_rewards - 50, cat_rewards
-                )
+                cat_rewards = torch.where(cat_rewards > 30, cat_rewards - 50, cat_rewards)
             # Clamp to prevent index errors, though rewards should be in range
             cat_rewards = torch.clamp(cat_rewards, 0, max_score_bins - 1)
             dist = torch.bincount(cat_rewards, minlength=max_score_bins).cpu()
@@ -369,12 +378,8 @@ class YahtzeeFast:
 
         # 3. Special Totals
         # Yahtzee is action 13 with reward 50
-        stats["yahtzee_count"] = (
-            ((all_category_actions == 13) & (all_rewards == 50)).sum().item()
-        )
+        stats["yahtzee_count"] = ((all_category_actions == 13) & (all_rewards == 50)).sum().item()
         # Bonus is reward > 50 for upper section actions (0-5)
-        stats["bonus_count"] = (
-            ((all_category_actions < 6) & (all_rewards > 30)).sum().item()
-        )
+        stats["bonus_count"] = ((all_category_actions < 6) & (all_rewards > 30)).sum().item()
 
         return stats

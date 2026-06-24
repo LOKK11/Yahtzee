@@ -1,3 +1,4 @@
+import copy
 from datetime import datetime, timedelta
 import time
 import os
@@ -14,7 +15,7 @@ import argparse
 import matplotlib.pyplot as plt
 import torch.func as func
 
-DICE_VALUES = 41
+DICE_VALUES = 36
 ROLLS_LEFT = 3
 NORMALIZED_SCORE_YIELDS = 15
 BONUS_YIELDS = 6
@@ -286,6 +287,7 @@ def get_batched_loss_fn(base_model, entropy_multiplier=0.01):
     # This will compute gradients for all N models simultaneously
     return func.vmap(func.grad(compute_single_loss), in_dims=(0, 0, 0, 0, 0))
 
+
 def prepare_vmap_ensemble(model, n_instances):
     """Stacks a list of models into a single vectorized function."""
     models_list = [model for _ in range(n_instances)]
@@ -295,22 +297,56 @@ def prepare_vmap_ensemble(model, n_instances):
         return func.functional_call(model, (p, b), (x,))
 
     vectorized_forward = func.vmap(fcall, in_dims=(0, 0, 0))
-    
+
     return vectorized_forward, params, buffers
+
+
+def extract_single_model(base_model, params, buffers, target_index):
+    """
+    Creates a standard PyTorch nn.Module instance from a specific index
+    of a vmapped ensemble.
+    """
+    single_model = copy.deepcopy(base_model)
+
+    single_state_dict = {}
+
+    for key, batched_tensor in params.items():
+        single_state_dict[key] = batched_tensor[target_index].clone()
+
+    for key, batched_tensor in buffers.items():
+        single_state_dict[key] = batched_tensor[target_index].clone()
+
+    single_model.load_state_dict(single_state_dict)
+
+    return single_model
+
+
+def sync_ensemble_to_best(params, buffers, best_idx):
+    """
+    Overwrites all instances in the batched ensemble with the
+    weights and buffers of the target index.
+    """
+    with torch.no_grad():
+        for param in params.values():
+            param.copy_(param[best_idx].unsqueeze(0).expand_as(param))
+
+        # Sync buffers (e.g., BatchNorm running stats)
+        for buffer in buffers.values():
+            buffer.copy_(buffer[best_idx].unsqueeze(0).expand_as(buffer))
 
 
 def update_vectorized_networks(
     optimizer, params, buffers, batched_grad_fn, states, actions, targets
 ):
     """Computes gradients and updates all N networks simultaneously."""
-    
+    optimizer.zero_grad()
     batched_grads = batched_grad_fn(params, buffers, states, actions, targets)
 
     for key, param in params.items():
         param.grad = batched_grads[key]
 
     optimizer.step()
-    optimizer.zero_grad()
+
 
 def soft_update_ensemble(main_params, target_params, main_buffers, target_buffers, tau=0.005):
     """
@@ -319,7 +355,7 @@ def soft_update_ensemble(main_params, target_params, main_buffers, target_buffer
     with torch.no_grad():
         for key in main_params.keys():
             target_params[key].mul_(1.0 - tau).add_(main_params[key], alpha=tau)
-            
+
         for key in main_buffers.keys():
             if target_buffers[key].is_floating_point():
                 target_buffers[key].mul_(1.0 - tau).add_(main_buffers[key], alpha=tau)
@@ -328,15 +364,14 @@ def soft_update_ensemble(main_params, target_params, main_buffers, target_buffer
 
 
 def train_ensemble(
+    device,
     roll_policy_net: RollPolicyNet,
     category_policy_net: CategoryPolicyNet,
     roll_target_net: RollPolicyNet,
     category_target_net: CategoryPolicyNet,
-    device,
-    n_instances=8,
+    n_instances,
     num_iterations=1000,
     start_iter=0,
-    pretrained_provided=False,
 ):
     print(f"Training {n_instances} instances simultaneously via vmap on {device}...")
     roll_policy_net.to(device)
@@ -344,42 +379,59 @@ def train_ensemble(
     roll_target_net.to(device)
     category_target_net.to(device)
 
-    ROLL_BATCH_SIZE = 9
+    ROLL_BATCH_SIZE = 1
     CATEGORY_BATCH_SIZE = 1
     SIMUL_GAMES = 8192
-    TRAINING_BATCH_SIZE = 2048
-    TRAIN_COUNT = 64
+    TRAINING_BATCH_SIZE = 512
+    TRAIN_COUNT = 32
     N_STEP = 2
     EVALUATION_FREQUENCY = 10
+    EXAMPLE_BATCH_COUNT = 4
+
+    fig, axes, rects = setup_yahtzee_plots()
 
     roll_forward, roll_params, roll_buffers = prepare_vmap_ensemble(roll_policy_net, n_instances)
-    category_forward, category_params, category_buffers = prepare_vmap_ensemble(category_policy_net, n_instances)
-    roll_target_forward, roll_target_params, roll_target_buffers = prepare_vmap_ensemble(roll_target_net, n_instances)
-    category_target_forward, category_target_params, category_target_buffers = prepare_vmap_ensemble(category_target_net, n_instances)
-
-    roll_optimizer = optim.Adam(roll_params.values(), lr=1e-4)
-    category_optimizer = optim.Adam(category_params.values(), lr=1e-4)
-    roll_scheduler = torch.optim.lr_scheduler.ExponentialLR(roll_optimizer, gamma=1)
-    category_scheduler = torch.optim.lr_scheduler.ExponentialLR(
-        category_optimizer, gamma=1
+    category_forward, category_params, category_buffers = prepare_vmap_ensemble(
+        category_policy_net, n_instances
+    )
+    roll_target_forward, roll_target_params, roll_target_buffers = prepare_vmap_ensemble(
+        roll_target_net, n_instances
+    )
+    category_target_forward, category_target_params, category_target_buffers = (
+        prepare_vmap_ensemble(category_target_net, n_instances)
     )
 
-    roll_examples = []
-    category_examples = []
-    current_examples = None
+    roll_optimizer = optim.Adam(roll_params.values(), lr=2e-4)
+    category_optimizer = optim.Adam(category_params.values(), lr=2e-4)
+    roll_scheduler = torch.optim.lr_scheduler.ExponentialLR(roll_optimizer, gamma=1)
+    category_scheduler = torch.optim.lr_scheduler.ExponentialLR(category_optimizer, gamma=1)
 
+    roll_states = torch.tensor([], device=device)
+    roll_actions = torch.tensor([], device=device, dtype=torch.int32)
+    roll_rewards = torch.tensor([], device=device)
+    roll_next_states = torch.tensor([], device=device)
+    roll_dones = torch.tensor([], device=device)
+    roll_next_masks = torch.tensor([], device=device)
+    category_states = torch.tensor([], device=device)
+    category_actions = torch.tensor([], device=device, dtype=torch.int32)
+    category_rewards = torch.tensor([], device=device)
+    category_next_states = torch.tensor([], device=device)
+    category_dones = torch.tensor([], device=device)
+    category_next_masks = torch.tensor([], device=device)
     gamma = 0.99
+    best_score = 0
 
     for iteration in range(start_iter, num_iterations):
         print(f"\n=== Ensemble Iteration {iteration + 1}/{num_iterations} ===")
+        epsilon = max(0.001, 1.0 - (iteration / 400))
         currently_training = (
             "roll"
             if iteration % (ROLL_BATCH_SIZE + CATEGORY_BATCH_SIZE) < ROLL_BATCH_SIZE
             else "category"
         )
+        print(f"Currently Training: {currently_training.upper()} | Epsilon: {epsilon:.4f}")
         if currently_training == "roll":
             policy_net = roll_policy_net
-            forward = roll_forward
             params = roll_params
             buffers = roll_buffers
             target_forward = roll_target_forward
@@ -387,11 +439,9 @@ def train_ensemble(
             target_buffers = roll_target_buffers
             optimizer = roll_optimizer
             scheduler = roll_scheduler
-            examples_per_iteration = SIMUL_GAMES * 2 * 15
-            current_examples = roll_examples
+            examples_per_iteration_per_instance = SIMUL_GAMES * 2 * 15 // n_instances
         else:
             policy_net = category_policy_net
-            forward = category_forward
             params = category_params
             buffers = category_buffers
             target_forward = category_target_forward
@@ -399,12 +449,25 @@ def train_ensemble(
             target_buffers = category_target_buffers
             optimizer = category_optimizer
             scheduler = category_scheduler
-            examples_per_iteration = SIMUL_GAMES * 15
-            current_examples = category_examples
+            examples_per_iteration_per_instance = SIMUL_GAMES * 15 // n_instances
+            states = category_states
+            actions = category_actions
+            rewards = category_rewards
+            next_states = category_next_states
+            dones = category_dones
+            next_masks = category_next_masks
 
-        epsilon = max(0.001, 1.0 - (iteration / 400))
         compute_batched_grads = get_batched_loss_fn(policy_net)
-        examples, avg_score, _ = self_play_ensemble(
+        (
+            new_states,
+            new_actions,
+            new_rewards,
+            new_next_states,
+            new_dones,
+            new_next_masks,
+            avg_score,
+            _,
+        ) = self_play_ensemble(
             roll_forward,
             category_forward,
             roll_params,
@@ -415,66 +478,135 @@ def train_ensemble(
             device=device,
             epsilon=epsilon,
             games_to_play=SIMUL_GAMES,
-            collect_examples=True,
             n_instances=n_instances,
             gamma=gamma,
         )
+        breakpoint()
+        print(f"Average Score: {avg_score:.2f}")
+        if currently_training == "roll":
+            roll_states = torch.cat([roll_states, new_states], dim=1)
+            roll_actions = torch.cat([roll_actions, new_actions], dim=1)
+            roll_rewards = torch.cat([roll_rewards, new_rewards], dim=1)
+            roll_next_states = torch.cat([roll_next_states, new_next_states], dim=1)
+            roll_dones = torch.cat([roll_dones, new_dones], dim=1)
+            roll_next_masks = torch.cat([roll_next_masks, new_next_masks], dim=1)
+            states = roll_states
+            actions = roll_actions
+            rewards = roll_rewards
+            next_states = roll_next_states
+            dones = roll_dones
+            next_masks = roll_next_masks
+        else:
+            category_states = torch.cat([category_states, new_states], dim=1)
+            category_actions = torch.cat([category_actions, new_actions], dim=1)
+            category_rewards = torch.cat([category_rewards, new_rewards], dim=1)
+            category_next_states = torch.cat([category_next_states, new_next_states], dim=1)
+            category_dones = torch.cat([category_dones, new_dones], dim=1)
+            category_next_masks = torch.cat([category_next_masks, new_next_masks], dim=1)
+            states = category_states
+            actions = category_actions
+            rewards = category_rewards
+            next_states = category_next_states
+            dones = category_dones
+            next_masks = category_next_masks
 
-        current_examples.extend(examples)
+        memory_size = states.size(1)
+        print(f"Collected {memory_size} examples for {currently_training} policy.")
+        instance_idx = torch.arange(n_instances, device=device).unsqueeze(1)
 
         # Train on collected data
         for _ in range(TRAIN_COUNT):
-            batch = random.sample(current_examples, TRAINING_BATCH_SIZE)
-            states, actions, targets = calculate_targets_ensemble(
+            sample_indices = torch.randint(
+                low=0, high=memory_size, size=(n_instances, TRAINING_BATCH_SIZE), device=device
+            )
+            states_batch = states[instance_idx, sample_indices]
+            actions_batch = actions[instance_idx, sample_indices]
+            rewards_batch = rewards[instance_idx, sample_indices]
+            next_states_batch = next_states[instance_idx, sample_indices]
+            dones_batch = dones[instance_idx, sample_indices]
+            next_masks_batch = next_masks[instance_idx, sample_indices]
+            states_batch, actions_batch, targets = calculate_targets_ensemble(
                 target_forward,
                 target_params,
                 target_buffers,
-                batch,
-                TRAINING_BATCH_SIZE,
+                states_batch,
+                actions_batch,
+                rewards_batch,
+                next_states_batch,
+                dones_batch,
+                next_masks_batch,
                 gamma=gamma,
                 n_step=N_STEP,
-                n_instances=n_instances,
             )
             update_vectorized_networks(
-                optimizer, params, buffers, compute_batched_grads, states, actions, targets
+                optimizer,
+                params,
+                buffers,
+                compute_batched_grads,
+                states_batch,
+                actions_batch,
+                targets,
             )
-        soft_update_ensemble(roll_params, roll_target_params, roll_buffers, roll_target_buffers, tau=0.01)
-
-
-    # TODO: Continue here
-    # 7. Final Evaluation and Selection
-    print("\nTraining complete. Evaluating all instances...")
-    best_score = -1
-    best_idx = 0
-
-    for i in range(n_instances):
-        instance_weights = {k: v[i].detach() for k, v in roll_params.items()}
-        roll_policy_net.load_state_dict(instance_weights)
-
-        _, avg_score, _ = self_play(
-            roll_policy_net,
-            CategoryPolicyNet().to(device),
-            "roll",
-            device=device,
-            epsilon=0.0,
-            games_to_play=8192,
-            collect_examples=False,
+        soft_update_ensemble(
+            roll_params, roll_target_params, roll_buffers, roll_target_buffers, tau=0.01
         )
-        print(f"Final Evaluation Instance {i}: Score {avg_score:.2f}")
+        scheduler.step()
+
+        if memory_size >= EXAMPLE_BATCH_COUNT * examples_per_iteration_per_instance:
+            if currently_training == "roll":
+                roll_states = roll_states[:, examples_per_iteration_per_instance:].clone()
+                roll_actions = roll_actions[:, examples_per_iteration_per_instance:].clone()
+                roll_rewards = roll_rewards[:, examples_per_iteration_per_instance:].clone()
+                roll_next_states = roll_next_states[:, examples_per_iteration_per_instance:].clone()
+                roll_dones = roll_dones[:, examples_per_iteration_per_instance:].clone()
+                roll_next_masks = roll_next_masks[:, examples_per_iteration_per_instance:].clone()
+            else:
+                category_states = category_states[:, examples_per_iteration_per_instance:].clone()
+                category_actions = category_actions[:, examples_per_iteration_per_instance:].clone()
+                category_rewards = category_rewards[:, examples_per_iteration_per_instance:].clone()
+                category_next_states = category_next_states[
+                    :, examples_per_iteration_per_instance:
+                ].clone()
+                category_dones = category_dones[:, examples_per_iteration_per_instance:].clone()
+                category_next_masks = category_next_masks[
+                    :, examples_per_iteration_per_instance:
+                ].clone()
+
+        if (iteration + 1) % EVALUATION_FREQUENCY:
+            continue
+
+        print("\nEvaluating Ensemble Performance...")
+        avg_score, stats, best_instance_idx = self_play_ensemble(
+            roll_forward,
+            category_forward,
+            roll_params,
+            category_params,
+            roll_buffers,
+            category_buffers,
+            currently_training,
+            device=device,
+            epsilon=0,
+            games_to_play=SIMUL_GAMES,
+            n_instances=n_instances,
+            gamma=gamma,
+            evaluation_mode=True,
+        )
+        update_yahtzee_stats(fig, rects, axes, stats, avg_score, SIMUL_GAMES // n_instances, 0)
+
+        sync_ensemble_to_best(roll_params, roll_buffers, best_instance_idx)
+        sync_ensemble_to_best(category_params, category_buffers, best_instance_idx)
+
         if avg_score > best_score:
             best_score = avg_score
-            best_idx = i
+            save_models(
+                extract_single_model(roll_policy_net, roll_params, roll_buffers, best_instance_idx),
+                extract_single_model(
+                    category_policy_net, category_params, category_buffers, best_instance_idx
+                ),
+                "models/best_model_ensemble.pth",
+            )
 
-    print(f"\n=> Keeping Instance {best_idx} with Best Score: {best_score:.2f}")
-
-    # Extract the winning weights and return standard model
-    best_weights = {
-        k: v[best_idx].detach().clone() for k, v in roll_params.items()
-    }
-    best_model = RollPolicyNet().to(device)
-    best_model.load_state_dict(best_weights)
-
-    return best_model
+        print(f"Keeping Instance {best_instance_idx} with Best Score: {avg_score:.2f}")
 
 
 def save_model(model, path):
@@ -548,15 +680,11 @@ def self_play(
     roll_action_stats_list = []
     category_actions_stats_list = []
 
-    states_collected_per_round = (
-        2 if currently_training == "roll" and not collect_stats else 1
-    )
+    states_collected_per_round = 2 if currently_training == "roll" and not collect_stats else 1
 
     for _ in range(rounds_in_game):
         for _ in range(2):
-            state, actions, mask = select_roll_action(
-                env, roll_policy_net, device, epsilon
-            )
+            state, actions, mask = select_roll_action(env, roll_policy_net, device, epsilon)
             if collect_examples and currently_training == "roll":
                 states_list.append(state)
                 actions_list.append(actions)
@@ -626,6 +754,7 @@ def self_play(
 
     return examples, average_score, stats
 
+
 def self_play_ensemble(
     roll_forward,
     category_forward,
@@ -635,13 +764,12 @@ def self_play_ensemble(
     category_buffers,
     currently_training,
     device,
+    n_instances,
     epsilon=0,
     games_to_play=8192,
-    collect_stats=False,
-    collect_examples=True,
     gamma=1.0,
     n_step=2,
-    n_instances=8,
+    evaluation_mode=False,
 ):
     env = YahtzeeFast(games_to_play, device=device)
     rounds_in_game = 15
@@ -654,52 +782,80 @@ def self_play_ensemble(
     roll_action_stats_list = []
     category_actions_stats_list = []
 
-    states_collected_per_round = (
-        2 if currently_training == "roll" and not collect_stats else 1
-    )
+    games_per_instance = games_to_play // n_instances
+
+    states_collected_per_round = 2 if currently_training == "roll" and not evaluation_mode else 1
 
     for _ in range(rounds_in_game):
         for _ in range(2):
             state, actions, mask = select_roll_action_ensemble(
-                env, roll_forward, roll_params, roll_buffers, n_instances, device, epsilon, games_to_play,
+                env,
+                roll_forward,
+                roll_params,
+                roll_buffers,
+                n_instances,
+                device,
+                epsilon,
+                games_to_play,
+                games_per_instance,
             )
-            if collect_examples and currently_training == "roll":
+            if not evaluation_mode and currently_training == "roll":
                 states_list.append(state)
                 actions_list.append(actions)
                 masks_list.append(mask)
-            if collect_stats:
+            elif evaluation_mode:
                 roll_action_stats_list.append(actions)
 
         state, actions, rewards, mask = select_category_action_ensemble(
-            env, category_forward, category_params, category_buffers, n_instances, device, epsilon, games_to_play,
+            env,
+            category_forward,
+            category_params,
+            category_buffers,
+            n_instances,
+            device,
+            epsilon,
+            games_to_play,
+            games_per_instance,
         )
 
-        if collect_examples and currently_training == "category":
+        if not evaluation_mode and currently_training == "category":
             states_list.append(state)
             actions_list.append(actions)
             masks_list.append(mask)
-        rewards_list.extend([rewards] * states_collected_per_round)
-        if collect_stats:
+        elif evaluation_mode:
             category_actions_stats_list.append(actions)
+        rewards_list.extend([rewards] * states_collected_per_round)
 
     all_rewards = torch.stack(rewards_list)
-    if collect_stats:
-        all_roll_action_stats = torch.stack(roll_action_stats_list)
-        all_category_action_stats = torch.stack(category_actions_stats_list)
+    if evaluation_mode:
+        average_score = env.get_average_final_score_ensemble(n_instances)
+        best_instance_idx = average_score.argmax().item()
+        best_roll_action_stats = torch.stack(roll_action_stats_list).view(
+            -1, n_instances, games_per_instance
+        )[:, best_instance_idx]
+        best_category_action_stats = torch.stack(category_actions_stats_list).view(
+            -1, n_instances, games_per_instance
+        )[:, best_instance_idx]
+        best_rewards = all_rewards.view(-1, n_instances, games_per_instance)[:, best_instance_idx]
         stats = env.analyze_batch_stats(
-            all_roll_action_stats.flatten(),
-            all_category_action_stats.flatten(),
-            all_rewards.flatten(),
+            best_roll_action_stats.flatten(),
+            best_category_action_stats.flatten(),
+            best_rewards.flatten(),
         )
+        return average_score.max().item(), stats, best_instance_idx
+
     average_score = env.get_average_final_score()
-    if not collect_examples:
-        return [], average_score, stats
     all_states = torch.stack(states_list)
     all_actions = torch.stack(actions_list)
     all_masks = torch.stack(masks_list)
 
-    examples = []
     state_count = len(all_states)
+    batch_states = []
+    batch_actions = []
+    batch_rewards = []
+    batch_next_states = []
+    batch_dones = []
+    batch_next_masks = []
     # Vectorized n-step calculation: Loop through time t and look ahead to t+n
     for t in range(state_count):
         rewards = torch.zeros(games_to_play, device=device)
@@ -720,17 +876,41 @@ def self_play_ensemble(
         # The state we bootstrap off of is `step_limit` steps in the future
         next_state_idx = min(t + step_limit, state_count - 1)
 
-        batch_data = zip(
-            all_states[t],
-            all_actions[t],
-            rewards,
-            all_states[next_state_idx],
-            dones,
-            all_masks[next_state_idx],
+        batch_states.append(all_states[t].view(n_instances, games_per_instance, -1))
+        batch_actions.append(all_actions[t].view(n_instances, games_per_instance, -1))
+        batch_rewards.append(rewards.view(n_instances, games_per_instance, -1))
+        batch_next_states.append(
+            all_states[next_state_idx].view(n_instances, games_per_instance, -1)
         )
-        examples.extend(batch_data)
+        batch_dones.append(dones.view(n_instances, games_per_instance, -1))
+        batch_next_masks.append(all_masks[next_state_idx].view(n_instances, games_per_instance, -1))
 
-    return examples, average_score, stats
+    def prepare_buffer(tensor_list):
+        """Helper function to reshape lists of tensors into
+        (n_instances, memory_size, feature_dim)"""
+        stacked = torch.stack(tensor_list)
+        T, N, G, D = stacked.shape
+        return stacked.permute(1, 0, 2, 3).reshape(N, T * G, D)
+
+    # Prepare the new data blocks
+    new_states = prepare_buffer(batch_states)
+    new_actions = prepare_buffer(batch_actions)
+    new_rewards = prepare_buffer(batch_rewards)
+    new_next_states = prepare_buffer(batch_next_states)
+    new_dones = prepare_buffer(batch_dones)
+    new_next_masks = prepare_buffer(batch_next_masks)
+
+    return (
+        new_states,
+        new_actions,
+        new_rewards,
+        new_next_states,
+        new_dones,
+        new_next_masks,
+        average_score,
+        stats,
+    )
+
 
 def select_roll_action(
     env: YahtzeeFast,
@@ -748,9 +928,7 @@ def select_roll_action(
 
         roll = torch.rand(q_values.size(0), device=device)
 
-        random_actions = (
-            torch.rand_like(q_values).masked_fill(~roll_mask, -1e12).argmax(dim=1)
-        )
+        random_actions = torch.rand_like(q_values).masked_fill(~roll_mask, -1e12).argmax(dim=1)
 
         actions = torch.where(
             roll < epsilon,
@@ -762,31 +940,36 @@ def select_roll_action(
 
     return state, actions, roll_mask
 
+
 def select_roll_action_ensemble(
-    env: YahtzeeFast, forward, params, buffers, n_instances, device, epsilon, games_to_play
+    env: YahtzeeFast,
+    forward,
+    params,
+    buffers,
+    n_instances,
+    device,
+    epsilon,
+    games_to_play,
+    games_per_instance,
 ):
     state = env.get_encoded_state()
     roll_mask = env.get_roll_action_masks()
 
-    games_per_set = games_to_play // n_instances
-    
-    # Reshape from [games_to_play, state_dim] -> [n_instances, games_per_set, state_dim]
-    state_reshaped = state.view(n_instances, games_per_set, -1)
+    # Reshape from [games_to_play, state_dim] -> [n_instances, games_per_instance, state_dim]
+    state_reshaped = state.view(n_instances, games_per_instance, -1)
 
     with torch.no_grad():
         # VMAP MAGIC: Passes n_instances batches through n_instances networks simultaneously
         q_values_reshaped = forward(params, buffers, state_reshaped)
-        
+
         # Flatten back to [games_to_play, action_dim] for the environment
         q_values = q_values_reshaped.view(games_to_play, -1)
-        
+
         q_values = q_values.masked_fill(~roll_mask, -1e12)
         roll = torch.rand(q_values.size(0), device=device)
-        random_actions = (
-            torch.rand_like(q_values).masked_fill(~roll_mask, -1e12).argmax(dim=1)
-        )
-        actions = torch.where(
-            roll < epsilon, random_actions, q_values.argmax(dim=1)
+        random_actions = torch.rand_like(q_values).masked_fill(~roll_mask, -1e12).argmax(dim=1)
+        actions = torch.where(roll < epsilon, random_actions, q_values.argmax(dim=1)).to(
+            torch.int32
         )
 
     _ = env.step(actions, action_type="roll")
@@ -805,9 +988,7 @@ def select_category_action(
 
         roll = torch.rand(q_values.size(0), device=device)
 
-        random_actions = (
-            torch.rand_like(q_values).masked_fill(~mask, -1e12).argmax(dim=1)
-        )
+        random_actions = torch.rand_like(q_values).masked_fill(~mask, -1e12).argmax(dim=1)
 
         actions = torch.where(
             roll < epsilon,
@@ -819,36 +1000,40 @@ def select_category_action(
 
     return state, actions, rewards, mask
 
+
 def select_category_action_ensemble(
-    env: YahtzeeFast, forward, params, buffers, n_instances, device, epsilon, games_to_play
+    env: YahtzeeFast,
+    forward,
+    params,
+    buffers,
+    n_instances,
+    device,
+    epsilon,
+    games_to_play,
+    games_per_instance,
 ):
     state = env.get_encoded_state()[:, ROLL_SPECIFIC_INPUTS:]
     mask = env.get_category_action_masks()
-    
-    games_per_instance = games_to_play // n_instances
-    
+
     # Reshape from [games_to_play, state_dim] -> [n_instances, games_per_instance, state_dim]
     state_reshaped = state.view(n_instances, games_per_instance, -1)
 
     with torch.no_grad():
         q_values_reshaped = forward(params, buffers, state_reshaped)
         q_values = q_values_reshaped.view(games_to_play, -1)
-        
+
         q_values = q_values.masked_fill(~mask, -1e12)
         roll = torch.rand(q_values.size(0), device=device)
-        random_actions = (
-            torch.rand_like(q_values).masked_fill(~mask, -1e12).argmax(dim=1)
-        )
-        actions = torch.where(
-            roll < epsilon, random_actions, q_values.argmax(dim=1)
+        random_actions = torch.rand_like(q_values).masked_fill(~mask, -1e12).argmax(dim=1)
+        actions = torch.where(roll < epsilon, random_actions, q_values.argmax(dim=1)).to(
+            torch.int32
         )
 
     rewards = env.step(actions, action_type="category")
     return state, actions, rewards, mask
 
-def update_yahtzee_stats(
-    fig, rects, axes, stats, avg_score, games_played, epsilon, stop=False
-):
+
+def update_yahtzee_stats(fig, rects, axes, stats, avg_score, games_played, epsilon, stop=False):
     """Update the wide figure with new batch statistics."""
     fig.suptitle(
         f"Games: {games_played}, Avg Score: {avg_score:.2f}, "
@@ -957,9 +1142,7 @@ def train_from_scratch(
     roll_optimizer = optim.Adam(roll_policy_net.parameters(), lr=learning_rate)
     roll_scheduler = torch.optim.lr_scheduler.ExponentialLR(roll_optimizer, gamma=0.8)
     category_optimizer = optim.Adam(category_policy_net.parameters(), lr=learning_rate)
-    category_scheduler = torch.optim.lr_scheduler.ExponentialLR(
-        category_optimizer, gamma=1
-    )
+    category_scheduler = torch.optim.lr_scheduler.ExponentialLR(category_optimizer, gamma=1)
     roll_examples = []
     category_examples = []
     current_examples = None
@@ -1007,12 +1190,8 @@ def train_from_scratch(
                 )
                 if avg_score > best_avg_score:
                     best_avg_score = avg_score
-                    save_models(
-                        roll_policy_net, category_policy_net, "models/best_model.pth"
-                    )
-                update_yahtzee_stats(
-                    fig, rects, axes, stats, avg_score, SIMUL_GAMES, 0.0
-                )
+                    save_models(roll_policy_net, category_policy_net, "models/best_model.pth")
+                update_yahtzee_stats(fig, rects, axes, stats, avg_score, SIMUL_GAMES, 0.0)
                 avg_score_list.append(avg_score)
                 iteration_list.append(iteration + 1)
 
@@ -1077,28 +1256,20 @@ def train_from_scratch(
             if not previous_times:
                 previous_times = [current_time - period_start] * EVALUATION_FREQUENCY
             else:
-                previous_times[iteration % EVALUATION_FREQUENCY] = (
-                    current_time - period_start
-                )
+                previous_times[iteration % EVALUATION_FREQUENCY] = current_time - period_start
             period_start = current_time
             estimated_seconds = (
-                sum(previous_times)
-                / len(previous_times)
-                * (num_iterations - iteration - 1)
+                sum(previous_times) / len(previous_times) * (num_iterations - iteration - 1)
             )
             estimated_time = timedelta(seconds=int(estimated_seconds))
             print(f"Estimated time remaining: {str(estimated_time).split('.')[0]}")
     except KeyboardInterrupt:
         print("Training interrupted by user.")
         print("Saving current model...")
-        save_models(
-            roll_policy_net, category_policy_net, "models/interrupted_model.pth"
-        )
+        save_models(roll_policy_net, category_policy_net, "models/interrupted_model.pth")
     finally:
         total_elapsed = datetime.now() - total_time_start
-        plot_training_progress(
-            iteration_list, avg_score_list, best_avg_score, total_elapsed
-        )
+        plot_training_progress(iteration_list, avg_score_list, best_avg_score, total_elapsed)
     return roll_policy_net
 
 
@@ -1139,9 +1310,7 @@ def play_category_rounds(
                     best_actions,
                 )
 
-                random_actions = (
-                    torch.rand_like(q_values).masked_fill(~mask, -1e12).argmax(dim=1)
-                )
+                random_actions = torch.rand_like(q_values).masked_fill(~mask, -1e12).argmax(dim=1)
 
                 actions = torch.where(
                     roll < epsilon,
@@ -1159,9 +1328,7 @@ def play_category_rounds(
             actions_list.append(actions)
 
         rewards, average_reward = env.step(actions)
-        rewards_list.extend(
-            [rewards / (max_scores[category] ** env.REWARD_EXPONENT)] * steps
-        )
+        rewards_list.extend([rewards / (max_scores[category] ** env.REWARD_EXPONENT)] * steps)
         total_average_reward += average_reward
 
     total_average_reward /= rounds
@@ -1265,12 +1432,8 @@ def plot_training_progress(iterations, avg_scores, best_avg_score, total_elapsed
 
 
 def soft_update(target_net, policy_net, tau):
-    for target_param, policy_param in zip(
-        target_net.parameters(), policy_net.parameters()
-    ):
-        target_param.data.copy_(
-            tau * policy_param.data + (1.0 - tau) * target_param.data
-        )
+    for target_param, policy_param in zip(target_net.parameters(), policy_net.parameters()):
+        target_param.data.copy_(tau * policy_param.data + (1.0 - tau) * target_param.data)
 
 
 def calculate_targets(target_net, batch, gamma=1.0, n_step=2):
@@ -1303,42 +1466,33 @@ def calculate_targets(target_net, batch, gamma=1.0, n_step=2):
 
     return states, actions, targets
 
-def calculate_targets_ensemble(target_forward, target_params, target_buffers, batch, batch_size, gamma=1.0, n_step=2, n_instances=8):
-    (
-        states,
-        actions,
-        rewards,
-        next_states,
-        dones,
-        next_masks,
-    ) = zip(*batch)
 
-    states = torch.stack(states)
-    actions = torch.stack(actions).unsqueeze(1)
-    rewards = torch.stack(rewards).unsqueeze(1)
-    next_states = torch.stack(next_states)
-    dones = torch.stack(dones).unsqueeze(1)
-    next_masks = torch.stack(next_masks)
-
-    states_per_instance = batch_size // n_instances
-    next_states = next_states.view(n_instances, states_per_instance, -1)
-
+def calculate_targets_ensemble(
+    target_forward,
+    target_params,
+    target_buffers,
+    states,
+    actions,
+    rewards,
+    next_states,
+    dones,
+    next_masks,
+    gamma,
+    n_step,
+):
     with torch.no_grad():
         next_q_values = target_forward(target_params, target_buffers, next_states)
-        next_q_values = next_q_values.view(batch_size, -1)
+
         # Mask out invalid future actions
-        next_q_values = next_q_values.masked_fill(~next_masks, -1e12)
+        next_q_values = next_q_values.masked_fill(~next_masks.bool(), -1e12)
 
         # Bellman equation: Reward + Discounted Max Future Q
-        # If the game is done, we don't add the future Q value.
-        targets = rewards + next_q_values.max(dim=1, keepdim=True)[0] * (1 - dones) * (
-            gamma**n_step
-        )
+        # next_q_values.max(dim=-1) computes the max over the action dimension.
+        max_next_q = next_q_values.max(dim=-1, keepdim=True)[0]
 
-    states = states.view(n_instances, states_per_instance, -1)
-    actions = actions.view(n_instances, states_per_instance, -1)
-    targets = targets.view(n_instances, states_per_instance, -1)
+        targets = rewards + max_next_q * (1 - dones) * (gamma**n_step)
 
+    # The shapes returned are inherently (n_instances, TRAINING_BATCH_SIZE, feature_dim)
     return states, actions, targets
 
 
@@ -1356,9 +1510,7 @@ def benchmark_model(
         collect_stats=True,
     )
     fig, axes, rects = setup_yahtzee_plots()
-    update_yahtzee_stats(
-        fig, rects, axes, stats, average_score, SIMUL_GAMES, 0.0, stop=True
-    )
+    update_yahtzee_stats(fig, rects, axes, stats, average_score, SIMUL_GAMES, 0.0, stop=True)
 
 
 if __name__ == "__main__":
@@ -1388,6 +1540,12 @@ if __name__ == "__main__":
         default=0,
         help="Starting iteration for training (used for loading checkpoints)",
     )
+    parser.add_argument(
+        "--n-instances",
+        type=int,
+        default=8,
+        help="Number of parallel instances for ensemble training (must be a power of 2)",
+    )
     args = parser.parse_args()
     # Actions
     device = torch.device(
@@ -1403,9 +1561,7 @@ if __name__ == "__main__":
     category_target_net = CategoryPolicyNet()
     multi_category_net = MultiCategoryNet()
     if args.model_path:
-        load_models(
-            roll_policy_net, category_policy_net, args.model_path, device=device
-        )
+        load_models(roll_policy_net, category_policy_net, args.model_path, device=device)
         roll_target_net.load_state_dict(roll_policy_net.state_dict())
         category_target_net.load_state_dict(category_policy_net.state_dict())
 
@@ -1438,14 +1594,12 @@ if __name__ == "__main__":
 
     if args.mode == "train_ensemble":
         trained_model = train_ensemble(
+            device,
             roll_policy_net,
             category_policy_net,
             roll_target_net,
             category_target_net,
-            device=device,
-            n_instances=8,
-            num_iterations=50,
+            args.n_instances,
+            start_iter=args.start_iter,
         )
-        save_models(
-            trained_model, category_policy_net, "models/best_ensemble_model.pth"
-        )
+        save_models(trained_model, category_policy_net, "models/best_ensemble_model.pth")

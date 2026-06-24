@@ -7,9 +7,7 @@ def enable_neural_network_button(app):
     app.main_container.pack(fill="both", expand=True)
 
     # Left frame for AI
-    app.ai_frame = tk.Frame(
-        app.main_container, width=250, padx=10, relief="sunken", borderwidth=1
-    )
+    app.ai_frame = tk.Frame(app.main_container, width=250, padx=10, relief="sunken", borderwidth=1)
     app.ai_frame.pack(side=tk.LEFT, fill="y")
 
     # Right frame for Game
@@ -24,9 +22,7 @@ def enable_neural_network_button(app):
         else:
             app.ai_label.config(text="Model not found in models/")
 
-    app.nn_button = tk.Button(
-        app.game_frame, text="Enable Neural Network", command=enable_nn
-    )
+    app.nn_button = tk.Button(app.game_frame, text="Enable Neural Network", command=enable_nn)
     app.nn_button.pack(pady=5)
 
     # Label to display AI suggestions (Moved to Left Frame)
@@ -65,7 +61,7 @@ def update_ai_suggestion(app):
     if app.game.neural_network:
         if app.game.rolls_left < 3:
             suggestion = app.game.get_ai_prediction()
-            app.ai_label.config(text=f"AI Suggests: {suggestion}")
+            app.ai_label.config(text=f"AI Suggests:\n{suggestion}")
         else:
             app.ai_label.config(text="AI Suggestions: Roll to start")
 
@@ -139,17 +135,13 @@ def category_frame(app):
         button.pack(side=tk.LEFT)
         app.category_buttons.append(button)
 
-        score_label = tk.Label(
-            category_frame, text="0", font=("Helvetica", 14), width=5
-        )
+        score_label = tk.Label(category_frame, text="0", font=("Helvetica", 14), width=5)
         score_label.pack(side=tk.RIGHT)
         app.category_score_labels.append(score_label)
 
 
 def total_score_label(app):
-    app.score_label = tk.Label(
-        app.game_frame, text="Total Score: 0", font=("Helvetica", 16)
-    )
+    app.score_label = tk.Label(app.game_frame, text="Total Score: 0", font=("Helvetica", 16))
     app.score_label.pack(pady=10)
 
 
@@ -177,9 +169,7 @@ def _update_scores(app):
         display_score = value if value is not None else score_preview
 
         button.config(text=f"{name.replace('_', ' ').title()}: {display_score}")
-        app.category_score_labels[cat_idx].config(
-            text=str(value if value is not None else 0)
-        )
+        app.category_score_labels[cat_idx].config(text=str(value if value is not None else 0))
 
         # Enable button only if not played and game not over
         if value is None:
