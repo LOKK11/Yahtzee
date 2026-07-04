@@ -481,7 +481,6 @@ def train_ensemble(
             n_instances=n_instances,
             gamma=gamma,
         )
-        breakpoint()
         print(f"Average Score: {avg_score:.2f}")
         if currently_training == "roll":
             roll_states = torch.cat([roll_states, new_states], dim=1)

@@ -9,23 +9,23 @@ class RollPolicyNet(nn.Module):
         self.common_stream = nn.Sequential(
             nn.Linear(
                 cfg.ROLL_SPECIFIC_INPUTS + cfg.COMMON_INPUTS,
-                512,
+                256,
             ),
             nn.ELU(),
-            nn.Linear(512, 512),
+            nn.Linear(256, 256),
             nn.ELU(),
         )
 
         self.value_stream = nn.Sequential(
-            nn.Linear(512, 512),
+            nn.Linear(256, 256),
             nn.ELU(),
-            nn.Linear(512, 1),
+            nn.Linear(256, 1),
         )
 
         self.advantage_stream = nn.Sequential(
-            nn.Linear(512, 512),
+            nn.Linear(256, 256),
             nn.ELU(),
-            nn.Linear(512, cfg.ROLL_ACTIONS),
+            nn.Linear(256, cfg.ROLL_ACTIONS),
         )
 
     def forward(self, x):
@@ -46,23 +46,23 @@ class CategoryPolicyNet(nn.Module):
         self.common_stream = nn.Sequential(
             nn.Linear(
                 cfg.COMMON_INPUTS,
-                512,
+                256,
             ),
             nn.ELU(),
-            nn.Linear(512, 512),
+            nn.Linear(256, 256),
             nn.ELU(),
         )
 
         self.value_stream = nn.Sequential(
-            nn.Linear(512, 512),
+            nn.Linear(256, 256),
             nn.ELU(),
-            nn.Linear(512, 1),
+            nn.Linear(256, 1),
         )
 
         self.advantage_stream = nn.Sequential(
-            nn.Linear(512, 512),
+            nn.Linear(256, 256),
             nn.ELU(),
-            nn.Linear(512, cfg.CATEGORY_ACTIONS),
+            nn.Linear(256, cfg.CATEGORY_ACTIONS),
         )
 
     def forward(self, x):

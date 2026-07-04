@@ -1,14 +1,13 @@
 import random
 import torch
-from YahtzeeAI import (
+from networks import (
     RollPolicyNet,
     CategoryPolicyNet,
-    load_models,
-    ROLL_SPECIFIC_INPUTS,
 )
+import config as cfg
 from YahtzeeFast import YahtzeeFast
 
-MODEL = "models/best_model_ensemble.pth"
+MODEL = "models/avg238.pth"
 
 
 class Yahtzee:
@@ -32,7 +31,7 @@ class Yahtzee:
         try:
             self.roll_policy_net = RollPolicyNet()
             self.category_policy_net = CategoryPolicyNet()
-            load_models(
+            self.load_from_path(
                 self.roll_policy_net,
                 self.category_policy_net,
                 MODEL,
@@ -46,6 +45,12 @@ class Yahtzee:
         except Exception as e:
             print(f"Failed to load model: {e}")
             return False
+
+    def load_from_path(self, roll_policy_net, category_policy_net, model_path, device="cpu"):
+        """Loads the model weights into the provided networks."""
+        checkpoint = torch.load(model_path, map_location=device)
+        roll_policy_net.load_state_dict(checkpoint["roll_policy_net"])
+        category_policy_net.load_state_dict(checkpoint["category_policy_net"])
 
     def sync_to_fast_env(self):
         """Updates the internal fast_env state to match current game state."""
@@ -72,7 +77,7 @@ class Yahtzee:
             policy_net = self.roll_policy_net
             mask = self.fast_env.get_roll_action_masks()
         else:
-            state = self.fast_env.get_encoded_state()[:, ROLL_SPECIFIC_INPUTS:]
+            state = self.fast_env.get_encoded_state()[:, cfg.ROLL_SPECIFIC_INPUTS :]
             policy_net = self.category_policy_net
             mask = self.fast_env.get_category_action_masks()
 

@@ -68,7 +68,8 @@ class YahtzeeFast:
 
         self.ROLL_ACTIONS = len(self.keep_combinations)
         self.CAT_ACTIONS = 15
-        self.ENCODED_STATE_SIZE = 36 + 3 + 15 + 6 + 16 + 1 + 1 + 1
+        self.ENCODED_ROLL_STATE_SIZE = 36 + 3 + 15 + 6 + 16 + 1 + 1 + 1
+        self.ENCODED_CAT_STATE_SIZE = 15 + 6 + 16 + 1 + 1 + 1
 
         self.reset()
 
@@ -280,10 +281,10 @@ class YahtzeeFast:
     def get_encoded_state(self):
         """
         Returns the state tensor compatible with YahtzeeNet.
-        Shape: (N, self.ENCODED_STATE_SIZE)
+        Shape: (N, self.ENCODED_ROLL_STATE_SIZE)
         """
         encoded = torch.zeros(
-            (self.n, self.ENCODED_STATE_SIZE), dtype=torch.float32, device=self.device
+            (self.n, self.ENCODED_ROLL_STATE_SIZE), dtype=torch.float32, device=self.device
         )
 
         # 1. Dice Values (36 inputs)
