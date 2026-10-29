@@ -1,9 +1,13 @@
 import argparse
-import torch
+import math
 import os
+
 import matplotlib.pyplot as plt
-from networks import RollPolicyNet, CategoryPolicyNet
+import torch
+from tqdm import tqdm
+
 import config as cfg
+from networks import CategoryPolicyNet, RollPolicyNet
 from YahtzeeFast import YahtzeeFast
 
 
@@ -24,11 +28,16 @@ class TrainEnsemble:
         self.epsilon_gamma = args.epsilon_gamma
         self.start_epsilon = args.start_epsilon
         self.min_epsilon = args.min_epsilon
-        self.n_step = args.n_step
+        self.start_n_step = args.start_n_step
+        self.min_n_step = args.min_n_step
+        self.n_step_decay_interval = args.n_step_decay_interval
+        self.n_step = self.start_n_step
         self.evaluation_frequency = args.evaluation_frequency
         self.max_roll_states = args.max_roll_states
         self.max_cat_states = args.max_category_states
-        self.gamma = args.gamma
+        self.start_gamma = args.start_gamma
+        self.gamma_increment = args.gamma_increment
+        self.gamma = args.start_gamma
         self.start_tau = args.start_tau
         self.tau_gamma = args.tau_gamma
         self.min_tau = args.min_tau
@@ -43,29 +52,26 @@ class TrainEnsemble:
         self.cat_mem_pointer = 0
         self.roll_states_in_memory = 0
         self.cat_states_in_memory = 0
-        self.best_seen_score = 0
+        self.best_seen_score = 0.0
+        self.best_avg_score = 0.0
+        self.last_train_avg_score = 0.0
+        self.learning_rate = self.learning_rate * self.learning_rate_gamma**self.start_iter
 
         self.setup_networks()
-
         self.setup_plots()
-
         self.setup_vmaps()
-
         self.setup_optimizers()
-
         self.setup_schedulers()
 
         self.env = YahtzeeFast(self.parallel_games, self.device)
-
         self.setup_state_buffers()
-
         self.best_score = 0
 
     def load_models(self, model_path):
         """Load multiple networks from a single file."""
         if not os.path.isfile(model_path):
             print(f"Error: Model file '{model_path}' does not exist")
-            return None
+            return
 
         checkpoint = torch.load(model_path, map_location=self.device)
 
@@ -76,7 +82,8 @@ class TrainEnsemble:
 
     def save_models(self):
         """Save multiple networks to a single file."""
-        os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
+        if os.path.dirname(self.save_path):
+            os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
 
         with torch.no_grad():
             for name, param in self.roll_policy_net.named_parameters():
@@ -90,7 +97,6 @@ class TrainEnsemble:
         }
 
         torch.save(checkpoint, self.save_path)
-        print(f"Models saved to {self.save_path}")
 
     def setup_networks(self):
         self.roll_policy_net = RollPolicyNet().to(self.device)
@@ -231,7 +237,6 @@ class TrainEnsemble:
         plt.pause(0.001)
 
     def evaluate(self):
-        print("Evaluating Network Performance")
         self.env = YahtzeeFast(self.parallel_games, self.device)
         T = cfg.ROLL_EXAMPLES_PER_GAME
         C = cfg.CATEGORY_EXAMPLES_PER_GAME
@@ -275,79 +280,141 @@ class TrainEnsemble:
         )
 
         self.best_avg_score = average_scores[best_instance_idx].item()
-        if self.best_avg_score > self.best_seen_score:
-            self.best_seen_score = self.best_avg_score
+        self.best_seen_score = max(self.best_seen_score, self.best_avg_score)
+        self.average_scores = average_scores
         self.best_instance_idx = best_instance_idx
         self.update_stats()
 
-    def sync_to_best_instance(self):
+    def sync_to_best_instance(self, n=5.0):
         """
-        Overwrites all instances in the batched ensemble with the
-        weights and buffers of the target index. Also copies the states, actions, masks etc
-        from the best instance to all the others.
+        Replaces the worst performing half of the models with copies of the top half,
+        mutating their weights and biases by a random noise of max +/- n percent.
         """
+        # Sort indices by performance (descending order)
+        sorted_indices = torch.argsort(self.average_scores, descending=True)
+        half_idx = self.n_instances // 2
+
+        top_half = sorted_indices[:half_idx]
+        bottom_half = sorted_indices[half_idx:]
+
         with torch.no_grad():
-            for param in self.roll_params.values():
-                param.copy_(param[self.best_instance_idx].unsqueeze(0).expand_as(param))
+            # Update and mutate weights & biases
+            for params in [self.roll_params, self.cat_params]:
+                for param in params.values():
+                    # Copy top half to bottom half
+                    param[bottom_half] = param[top_half].clone()
 
-            for buffer in self.roll_buffers.values():
-                buffer.copy_(buffer[self.best_instance_idx].unsqueeze(0).expand_as(buffer))
+                    # Apply uniform random noise between -n% and n%
+                    # (torch.rand_like generates [0, 1) -> scaled to [-n/100, n/100])
+                    noise = (torch.rand_like(param[bottom_half]) * 2 - 1) * (n / 100.0)
+                    param[bottom_half] *= 1.0 + noise
 
-            for param in self.cat_params.values():
-                param.copy_(param[self.best_instance_idx].unsqueeze(0).expand_as(param))
+            # Copy standard buffers (no mutation)
+            for buffers in [self.roll_buffers, self.cat_buffers]:
+                for buffer in buffers.values():
+                    buffer[bottom_half] = buffer[top_half].clone()
 
-            for buffer in self.cat_buffers.values():
-                buffer.copy_(buffer[self.best_instance_idx].unsqueeze(0).expand_as(buffer))
-
+            # Copy optimizer states
             for opt in [self.roll_optimizer, self.cat_optimizer]:
                 for param, state in opt.state.items():
                     if "exp_avg" in state:
-                        state["exp_avg"].copy_(
-                            state["exp_avg"][self.best_instance_idx]
-                            .unsqueeze(0)
-                            .expand_as(state["exp_avg"])
-                        )
+                        state["exp_avg"][bottom_half] = state["exp_avg"][top_half].clone()
                     if "exp_avg_sq" in state:
-                        state["exp_avg_sq"].copy_(
-                            state["exp_avg_sq"][self.best_instance_idx]
-                            .unsqueeze(0)
-                            .expand_as(state["exp_avg_sq"])
-                        )
+                        state["exp_avg_sq"][bottom_half] = state["exp_avg_sq"][top_half].clone()
 
-        instance_idx = torch.arange(self.n_instances, device=self.device).unsqueeze(1)
-        self.roll_states[instance_idx] = self.roll_states[self.best_instance_idx].clone()
-        self.roll_actions[instance_idx] = self.roll_actions[self.best_instance_idx].clone()
-        self.roll_rewards[instance_idx] = self.roll_rewards[self.best_instance_idx].clone()
-        self.roll_dones[instance_idx] = self.roll_dones[self.best_instance_idx].clone()
-        self.roll_next_states[instance_idx] = self.roll_next_states[self.best_instance_idx].clone()
-        self.roll_next_masks[instance_idx] = self.roll_next_masks[self.best_instance_idx].clone()
-        self.cat_states[instance_idx] = self.cat_states[self.best_instance_idx].clone()
-        self.cat_actions[instance_idx] = self.cat_actions[self.best_instance_idx].clone()
-        self.cat_rewards[instance_idx] = self.cat_rewards[self.best_instance_idx].clone()
-        self.cat_dones[instance_idx] = self.cat_dones[self.best_instance_idx].clone()
-        self.cat_next_states[instance_idx] = self.cat_next_states[self.best_instance_idx].clone()
-        self.cat_next_masks[instance_idx] = self.cat_next_masks[self.best_instance_idx].clone()
+        # Copy replay buffers (states, actions, rewards, masks)
+        self.roll_states[bottom_half] = self.roll_states[top_half].clone()
+        self.roll_actions[bottom_half] = self.roll_actions[top_half].clone()
+        self.roll_rewards[bottom_half] = self.roll_rewards[top_half].clone()
+        self.roll_dones[bottom_half] = self.roll_dones[top_half].clone()
+        self.roll_next_states[bottom_half] = self.roll_next_states[top_half].clone()
+        self.roll_next_masks[bottom_half] = self.roll_next_masks[top_half].clone()
+
+        self.cat_states[bottom_half] = self.cat_states[top_half].clone()
+        self.cat_actions[bottom_half] = self.cat_actions[top_half].clone()
+        self.cat_rewards[bottom_half] = self.cat_rewards[top_half].clone()
+        self.cat_dones[bottom_half] = self.cat_dones[top_half].clone()
+        self.cat_next_states[bottom_half] = self.cat_next_states[top_half].clone()
+        self.cat_next_masks[bottom_half] = self.cat_next_masks[top_half].clone()
+
+    def _get_tqdm_metrics(self, status=None):
+        """Format all useful training and evaluation info for the tqdm bar."""
+        metrics = {
+            "eps": f"{self.epsilon:.4f}",
+            "tau": f"{self.tau:.5f}",
+            "lr": f"{self.roll_optimizer.param_groups[0]['lr']:.6f}",
+            "gamma": f"{self.gamma:.5f}",
+            "n_step": self.n_step,
+            "train_avg": f"{self.last_train_avg_score:.2f}",
+            "r_mem": self.roll_states_in_memory,
+            "c_mem": self.cat_states_in_memory,
+        }
+        if self.best_avg_score > 0:
+            metrics["eval_avg"] = f"{self.best_avg_score:.2f}"
+            metrics["best"] = f"{self.best_seen_score:.2f}"
+        if status:
+            metrics["status"] = status
+        return metrics
 
     def train(self):
         """Train the RollPolicyNet and CategoryPolicyNet using n parallel
-        instances of the models so that on every x instances the best
-        model is chosen and the rest of the models are updated with the
-        state of the best model."""
+        instances of the models, displaying progress per epoch via tqdm."""
 
-        print(f"Training {self.n_instances} on device: {self.device}")
-        for iteration in range(self.start_iter, self.num_iterations):
-            print(f"\n=== Iteration {iteration + 1}/{self.num_iterations} ===")
-            self.epsilon = max(self.min_epsilon, self.epsilon_gamma**iteration)
-            self.tau = max(self.min_tau, self.start_tau * self.tau_gamma**iteration)
-            self.training_iteration()
+        print(f"Training {self.n_instances} instances on device: {self.device}")
 
-            if (iteration + 1) % self.evaluation_frequency:
-                continue
+        total_epochs = math.ceil(self.num_iterations / self.evaluation_frequency)
+        start_epoch = self.start_iter // self.evaluation_frequency
 
-            self.evaluate()
-            self.sync_to_best_instance()
-            if self.best_avg_score == self.best_seen_score:
-                self.save_models()
+        for epoch in range(start_epoch, total_epochs):
+            epoch_start = max(self.start_iter, epoch * self.evaluation_frequency)
+            epoch_end = min(self.num_iterations, (epoch + 1) * self.evaluation_frequency)
+
+            with tqdm(
+                range(epoch_start, epoch_end),
+                desc=f"Epoch {epoch + 1}/{total_epochs}",
+                unit="iter",
+                dynamic_ncols=True,
+            ) as pbar:
+                for iteration in pbar:
+                    self.epsilon = max(
+                        self.min_epsilon, self.start_epsilon * self.epsilon_gamma**iteration
+                    )
+                    self.tau = max(self.min_tau, self.start_tau * self.tau_gamma**iteration)
+                    self.gamma = min(1.0, self.start_gamma + self.gamma_increment * iteration)
+                    expected_n_step = max(
+                        self.min_n_step,
+                        self.start_n_step - (iteration // self.n_step_decay_interval),
+                    )
+                    if expected_n_step < self.n_step:
+                        tqdm.write(
+                            f"Decreasing n-step from {self.n_step} to {expected_n_step}. "
+                            "Flushing replay buffers to prevent math corruption..."
+                        )
+                        self.n_step = expected_n_step
+                        self.roll_mem_pointer = 0
+                        self.cat_mem_pointer = 0
+                        self.roll_states_in_memory = 0
+                        self.cat_states_in_memory = 0
+
+                    self.training_iteration()
+
+                    # Evaluate on the final iteration of the epoch BEFORE the loop exits
+                    if (iteration + 1) % self.evaluation_frequency == 0:
+                        pbar.set_postfix(self._get_tqdm_metrics(status="evaluating"), refresh=True)
+                        self.evaluate()
+                        self.sync_to_best_instance()
+
+                        saved = False
+                        if self.best_avg_score == self.best_seen_score:
+                            self.save_models()
+                            saved = True
+
+                        pbar.set_postfix(
+                            self._get_tqdm_metrics(status="saved" if saved else "done"),
+                            refresh=True,
+                        )
+                    else:
+                        pbar.set_postfix(self._get_tqdm_metrics(status="training"), refresh=True)
 
         plt.ioff()
         plt.show()
@@ -366,7 +433,9 @@ class TrainEnsemble:
         i = 0
         for r in range(cfg.ROUNDS_IN_GAME):
             for _ in range(2):
-                state = self.env.get_encoded_state()
+                roll_specific = self.env.get_encoded_roll_specific_state()
+                common_state = self.env.get_encoded_common_state()
+                state = torch.cat([roll_specific, common_state], dim=1)
                 mask = self.env.get_roll_action_masks()
 
                 with torch.no_grad():
@@ -377,7 +446,7 @@ class TrainEnsemble:
                 roll_actions[i] = actions
                 i += 1
 
-            state = self.env.get_encoded_state()[:, cfg.ROLL_SPECIFIC_INPUTS :]
+            state = self.env.get_encoded_common_state()
             mask = self.env.get_category_action_masks()
 
             with torch.no_grad():
@@ -412,12 +481,13 @@ class TrainEnsemble:
 
             # Surprise-weighted logic
             with torch.no_grad():
-                surprise = torch.clamp(targets - q_value_preds, min=0.0).detach()
+                surprise = torch.abs(targets - q_value_preds)
                 weight = 1.0 + (self.entropy_multiplier * surprise)
+                weight = torch.clamp(weight, min=1.0, max=10.0)
 
             raw_loss = torch.nn.functional.smooth_l1_loss(q_value_preds, targets, reduction="none")
-            weighted_loss = (weight * raw_loss).mean()
-            return weighted_loss
+            loss = (weight * raw_loss).mean()
+            return loss
 
         # Vectorize across dimension 0 (the N_INSTANCES dimension) for all inputs
         # This will compute gradients for all N models simultaneously
@@ -425,18 +495,15 @@ class TrainEnsemble:
 
     def training_iteration(self):
         """Do one training iteration."""
-        print(
-            f"Training with epsilon {self.epsilon:.3f}, "
-            f"tau {self.tau:.3f}, "
-            f"learning rate {self.roll_optimizer.param_groups[0]['lr']:.6f}"
-        )
         self.play_games()
         self.train_roll_net()
         self.train_category_net()
 
     def select_roll_action(self, epsilon):
         # Reshape from [games_to_play, state_dim] -> [n_instances, games_per_instance, state_dim]
-        state = self.env.get_encoded_state()
+        roll_specific = self.env.get_encoded_roll_specific_state()
+        common_state = self.env.get_encoded_common_state()
+        state = torch.cat([roll_specific, common_state], dim=1)
         mask = self.env.get_roll_action_masks()
         state_reshaped = state.view(self.n_instances, self.games_per_instance, -1)
 
@@ -459,7 +526,7 @@ class TrainEnsemble:
 
     def select_category_action(self, epsilon):
         # Reshape from [games_to_play, state_dim] -> [n_instances, games_per_instance, state_dim]
-        state = self.env.get_encoded_state()[:, cfg.ROLL_SPECIFIC_INPUTS :]
+        state = self.env.get_encoded_common_state()
         mask = self.env.get_category_action_masks()
         state_reshaped = state.view(self.n_instances, self.games_per_instance, -1)
 
@@ -642,10 +709,11 @@ class TrainEnsemble:
         self.roll_states_in_memory = min(RN + G * RE * self.n_instances, self.max_roll_states)
         self.cat_mem_pointer = (CP + G * CE) % CM
         self.cat_states_in_memory = min(CN + G * CE * self.n_instances, self.max_cat_states)
+
         avg_score = self.env.get_average_final_score()
-        print(f"Played {self.parallel_games} parallel games. Average score: {avg_score:.2f}")
-        print(f"Roll states in memory: {self.roll_states_in_memory}")
-        print(f"Category states in memory: {self.cat_states_in_memory}")
+        self.last_train_avg_score = (
+            avg_score.item() if isinstance(avg_score, torch.Tensor) else float(avg_score)
+        )
 
     def calculate_roll_targets(self):
         with torch.no_grad():
@@ -691,33 +759,31 @@ class TrainEnsemble:
 
     def soft_update_roll_target(self):
         with torch.no_grad():
-            for key in self.roll_params.keys():
-                self.roll_target_params[key].mul_(1.0 - self.tau).add_(
-                    self.roll_params[key], alpha=self.tau
-                )
+            for target_param, param in zip(
+                self.roll_target_params.values(), self.roll_params.values()
+            ):
+                target_param.lerp_(param, self.tau)
 
-            for key in self.roll_buffers.keys():
-                if self.roll_target_buffers[key].is_floating_point():
-                    self.roll_target_buffers[key].mul_(1.0 - self.tau).add_(
-                        self.roll_buffers[key], alpha=self.tau
-                    )
+            for target_buf, buf in zip(
+                self.roll_target_buffers.values(), self.roll_buffers.values()
+            ):
+                if target_buf.is_floating_point():
+                    target_buf.lerp_(buf, self.tau)
                 else:
-                    self.roll_target_buffers[key].copy_(self.roll_buffers[key])
+                    target_buf.copy_(buf)
 
     def soft_update_category_target(self):
         with torch.no_grad():
-            for key in self.cat_params.keys():
-                self.cat_target_params[key].mul_(1.0 - self.tau).add_(
-                    self.cat_params[key], alpha=self.tau
-                )
+            for target_param, param in zip(
+                self.cat_target_params.values(), self.cat_params.values()
+            ):
+                target_param.lerp_(param, self.tau)
 
-            for key in self.cat_buffers.keys():
-                if self.cat_target_buffers[key].is_floating_point():
-                    self.cat_target_buffers[key].mul_(1.0 - self.tau).add_(
-                        self.cat_buffers[key], alpha=self.tau
-                    )
+            for target_buf, buf in zip(self.cat_target_buffers.values(), self.cat_buffers.values()):
+                if target_buf.is_floating_point():
+                    target_buf.lerp_(buf, self.tau)
                 else:
-                    self.cat_target_buffers[key].copy_(self.cat_buffers[key])
+                    target_buf.copy_(buf)
 
     def train_roll_net(self):
         self.compute_grads = self.get_batched_loss_fn(self.roll_policy_net)
@@ -737,7 +803,7 @@ class TrainEnsemble:
             self.next_masks_batch = self.roll_next_masks[instance_idx, sample_indices]
             self.calculate_roll_targets()
             self.train_roll_batch()
-        self.soft_update_roll_target()
+            self.soft_update_roll_target()
         self.roll_scheduler.step()
 
     def train_category_net(self):
@@ -758,7 +824,7 @@ class TrainEnsemble:
             self.next_masks_batch = self.cat_next_masks[instance_idx, sample_indices]
             self.calculate_category_targets()
             self.train_category_batch()
-        self.soft_update_category_target()
+            self.soft_update_category_target()
         self.cat_scheduler.step()
 
 
@@ -786,7 +852,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--n-instances",
         type=int,
-        default=8,
+        default=16,
         help="Number of parallel instances for ensemble training (must be a power of 2)",
     )
     parser.add_argument(
@@ -817,13 +883,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=1e-4,
+        default=1e-3,
         help="Training learning rate",
     )
     parser.add_argument(
         "--learning-rate-gamma",
         type=float,
-        default=1.0,
+        default=0.995,
         help="The multiplier for learning rate for each iteration.",
     )
     parser.add_argument(
@@ -854,18 +920,30 @@ if __name__ == "__main__":
         help="The minimum value for epsilon during training.",
     )
     parser.add_argument(
-        "--n-step",
+        "--start-n-step",
         type=int,
         default=3,
-        help="N-step determines how many turns ahead the reward of a turn"
-        "is calculated from. If N-step = 2 the immediater reward of a turn"
+        help="Starting n-step value. N-step determines how many turns ahead the reward of a turn"
+        "is calculated from. If N-step = 2 the immediate reward of a turn"
         "is the sum of 2 next category placements' rewards. Default: 3",
+    )
+    parser.add_argument(
+        "--min-n-step",
+        type=int,
+        default=1,
+        help="The minimum value for n-step during training. Default: 1",
+    )
+    parser.add_argument(
+        "--n-step-decay-interval",
+        type=int,
+        default=250,
+        help="How many iterations before decreasing n-step by 1. Default: 250",
     )
     parser.add_argument(
         "--evaluation-frequency",
         type=int,
         default=10,
-        help="How often the model is evaluated and the graphs are updated. Default: 10",
+        help="How many iterations constitute an epoch before the model is evaluated. Default: 10",
     )
     parser.add_argument(
         "--max-roll-states",
@@ -882,29 +960,35 @@ if __name__ == "__main__":
         "network. Default: 1 000 000",
     )
     parser.add_argument(
-        "--gamma",
+        "--start-gamma",
         type=float,
-        default=0.99,
-        help="Reward discount for each next step. Default: 0.99",
+        default=0.97,
+        help="Gamma value at start. Gamma is reward discount for each next step. Default: 0.97",
+    )
+    parser.add_argument(
+        "--gamma-increment",
+        type=float,
+        default=0.00005,
+        help="The increment for gamma for each iteration. Default: 0.00005",
     )
     parser.add_argument(
         "--start-tau",
         type=float,
-        default=0.2,
+        default=0.01,
         help="Determines how big of a proportion of the trained networks properties. "
-        "are transformed to the target network per iteration. Default: 0.2",
+        "are transformed to the target network per iteration. Default: 0.01",
     )
     parser.add_argument(
         "--tau-gamma",
         type=float,
-        default=0.998,
-        help="The multiplier for tau for each iteration. Default: 0.998",
+        default=0.995,
+        help="The multiplier for tau for each iteration. Default: 0.995",
     )
     parser.add_argument(
         "--min-tau",
         type=float,
-        default=0.01,
-        help="The minimum value for tau during training. Default: 0.01",
+        default=0.001,
+        help="The minimum value for tau during training. Default: 0.001",
     )
     parser.add_argument(
         "--save-path",

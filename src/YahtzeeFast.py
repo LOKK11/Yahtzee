@@ -68,8 +68,8 @@ class YahtzeeFast:
 
         self.ROLL_ACTIONS = len(self.keep_combinations)
         self.CAT_ACTIONS = 15
-        self.ENCODED_ROLL_STATE_SIZE = 36 + 3 + 15 + 6 + 16 + 1 + 1 + 1
-        self.ENCODED_CAT_STATE_SIZE = 15 + 6 + 16 + 1 + 1 + 1
+        self.ENCODED_CAT_STATE_SIZE = 15 + 6 + 16 + 1 + 1 + 1 + 1
+        self.ENCODED_ROLL_STATE_SIZE = 36 + 3 + 2 + self.ENCODED_CAT_STATE_SIZE
 
         self.reset()
 
@@ -278,13 +278,13 @@ class YahtzeeFast:
 
         return mask
 
-    def get_encoded_state(self):
+    def get_encoded_roll_specific_state(self):
         """
-        Returns the state tensor compatible with YahtzeeNet.
-        Shape: (N, self.ENCODED_ROLL_STATE_SIZE)
+        Returns the roll-specific state tensor compatible with YahtzeeNet.
+        Shape: (N, 41)
         """
         encoded = torch.zeros(
-            (self.n, self.ENCODED_ROLL_STATE_SIZE), dtype=torch.float32, device=self.device
+            (self.n, 36 + 3 + 2), dtype=torch.float32, device=self.device
         )
 
         # 1. Dice Values (36 inputs)
@@ -303,13 +303,34 @@ class YahtzeeFast:
         encoded[torch.arange(self.n), idx + rl] = 1.0
 
         idx += 3
+        # 2.5 Straight progress (2 inputs: unique elements in 1-5 and 2-6)
+        c = counts[:, 1:7] > 0
+        
+        prog_1_5 = c[:, 0:5].sum(dim=1, dtype=torch.float32)
+        prog_2_6 = c[:, 1:6].sum(dim=1, dtype=torch.float32)
+        
+        encoded[:, idx] = prog_1_5 / 5.0
+        encoded[:, idx + 1] = prog_2_6 / 5.0
+
+        return encoded
+
+    def get_encoded_common_state(self):
+        """
+        Returns the common inputs state tensor compatible with YahtzeeNet.
+        Shape: (N, 41)
+        """
+        encoded = torch.zeros(
+            (self.n, 15 + 6 + 16 + 1 + 1 + 1 + 1), dtype=torch.float32, device=self.device
+        )
+        idx = 0
+        
         # 3. Normalized score yields (15 inputs)
         not_played = (self.scores[:, :15] == -1).to(torch.float32)
         all_scores = self.get_potential_scores()[:, :15] * not_played
         normalized_scores = all_scores / self.max_scores
         encoded[:, idx : idx + 15] = normalized_scores
-
         idx += 15
+
         # 4. Would yield bonus (6 inputs)
         would_yield_bonus = torch.zeros((self.n, 6), dtype=torch.float32, device=self.device)
         for i in range(6):
@@ -348,6 +369,14 @@ class YahtzeeFast:
         ).sum(dim=1)
         bonus_available = (upper_score < 63) & (max_possible_upper_score >= 63)
         encoded[:, idx] = bonus_available.to(torch.float32)
+        idx += 1
+
+        # 9. Bonus average needed (1 input for sacrifice math)
+        played_upper = (upper_vals != -1).sum(dim=1)
+        remaining_upper = torch.clamp(6 - played_upper, min=1)
+        bonus_avg_needed = torch.clamp((63.0 - upper_score) / remaining_upper, min=0.0)
+        encoded[:, idx] = bonus_avg_needed / 63.0
+        
         return encoded
 
     @torch.no_grad()
